@@ -78,6 +78,45 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         query: Option<String>,
     },
+    Moments {
+        #[serde(default = "default_limit_20")]
+        limit: usize,
+        /// 限定发布人（支持备注/昵称/wxid 模糊匹配）
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+        /// 关键词搜索（匹配 contentDesc）
+        #[serde(skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+        /// 是否附带媒体 URL 列表
+        #[serde(default)]
+        with_media: bool,
+    },
+    MomentsInbox {
+        #[serde(default = "default_limit_50")]
+        limit: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+        /// 只看未读
+        #[serde(default)]
+        unread_only: bool,
+    },
+    FriendRequests {
+        #[serde(default = "default_limit_50")]
+        limit: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+        /// 只看自己发出的 / 收到的（默认全部）：incoming / outgoing
+        #[serde(skip_serializing_if = "Option::is_none")]
+        direction: Option<String>,
+    },
 }
 
 

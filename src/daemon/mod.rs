@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod query;
 pub mod server;
+pub mod search_index;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -49,11 +50,14 @@ async fn async_run() -> Result<()> {
     let db = Arc::new(cache::DbCache::new(cfg.db_dir.clone(), all_keys.clone()).await?);
 
     // 收集消息 DB 列表
+    // - message/message_N.db: 普通聊天（私聊、群聊）
+    // - message/biz_message_N.db: 公众号/服务号消息
     let msg_db_keys: Vec<String> = all_keys.keys()
         .filter(|k| {
             let k = k.replace('\\', "/");
-            k.contains("message/message_") && k.ends_with(".db")
+            k.ends_with(".db")
                 && !k.contains("_fts") && !k.contains("_resource")
+                && (k.contains("message/message_") || k.contains("message/biz_message_"))
         })
         .cloned()
         .collect();
@@ -75,13 +79,16 @@ async fn async_run() -> Result<()> {
     let _ = db.get("session/session.db").await;
     eprintln!("[daemon] 预热完成，联系人 {} 个", names.map.len());
 
+    // 初始化搜索索引（空库，首次 wx search 触发同步）
+    let index = Arc::new(search_index::SearchIndex::new(&config::cache_dir())?);
+
     // 包一层内部 Arc：IPC 请求取 guard 后只做 Arc::clone（O(1)），
     // 避免每次请求都全量 clone 几千个联系人的 HashMap。
     // 用 tokio::sync::RwLock 允许 guard 跨 await（当前不跨，为未来 reload 留余地）。
     let names_arc = Arc::new(tokio::sync::RwLock::new(Arc::new(names)));
 
     // 启动 IPC server（阻塞）
-    server::serve(Arc::clone(&db), Arc::clone(&names_arc)).await?;
+    server::serve(Arc::clone(&db), Arc::clone(&names_arc), Arc::clone(&index)).await?;
 
     Ok(())
 }

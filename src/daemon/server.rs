@@ -5,16 +5,18 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::ipc::{Request, Response};
 use super::cache::DbCache;
 use super::query::Names;
+use super::search_index::SearchIndex;
 
 /// 启动 IPC server（Unix socket / Windows named pipe）
 pub async fn serve(
     db: Arc<DbCache>,
     names: Arc<tokio::sync::RwLock<Arc<Names>>>,
+    index: Arc<SearchIndex>,
 ) -> Result<()> {
     #[cfg(unix)]
-    serve_unix(db, names).await?;
+    serve_unix(db, names, index).await?;
     #[cfg(windows)]
-    serve_windows(db, names).await?;
+    serve_windows(db, names, index).await?;
     Ok(())
 }
 
@@ -22,6 +24,7 @@ pub async fn serve(
 async fn serve_unix(
     db: Arc<DbCache>,
     names: Arc<tokio::sync::RwLock<Arc<Names>>>,
+    index: Arc<SearchIndex>,
 ) -> Result<()> {
     use tokio::net::UnixListener;
     let sock_path = crate::config::sock_path();
@@ -45,9 +48,10 @@ async fn serve_unix(
         let (stream, _) = listener.accept().await?;
         let db2 = Arc::clone(&db);
         let names2 = Arc::clone(&names);
+        let index2 = Arc::clone(&index);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection_unix(stream, db2, names2).await {
+            if let Err(e) = handle_connection_unix(stream, db2, names2, index2).await {
                 eprintln!("[server] 连接处理错误: {}", e);
             }
         });
@@ -59,6 +63,7 @@ async fn handle_connection_unix(
     stream: tokio::net::UnixStream,
     db: Arc<DbCache>,
     names: Arc<tokio::sync::RwLock<Arc<Names>>>,
+    index: Arc<SearchIndex>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -78,7 +83,7 @@ async fn handle_connection_unix(
         }
     };
 
-    let resp = dispatch(req, &db, &names).await;
+    let resp = dispatch(req, &db, &names, &index).await;
     writer.write_all(resp.to_json_line()?.as_bytes()).await?;
     Ok(())
 }
@@ -87,6 +92,7 @@ async fn handle_connection_unix(
 async fn serve_windows(
     db: Arc<DbCache>,
     names: Arc<tokio::sync::RwLock<Arc<Names>>>,
+    index: Arc<SearchIndex>,
 ) -> Result<()> {
     use interprocess::local_socket::{
         tokio::prelude::*, GenericNamespaced, ListenerOptions,
@@ -104,9 +110,10 @@ async fn serve_windows(
         let conn = listener.accept().await?;
         let db2 = Arc::clone(&db);
         let names2 = Arc::clone(&names);
+        let index2 = Arc::clone(&index);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection_windows(conn, db2, names2).await {
+            if let Err(e) = handle_connection_windows(conn, db2, names2, index2).await {
                 eprintln!("[server] 连接处理错误: {}", e);
             }
         });
@@ -118,6 +125,7 @@ async fn handle_connection_windows(
     conn: interprocess::local_socket::tokio::Stream,
     db: Arc<DbCache>,
     names: Arc<tokio::sync::RwLock<Arc<Names>>>,
+    index: Arc<SearchIndex>,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(conn);
     let mut lines = BufReader::new(reader).lines();
@@ -136,7 +144,7 @@ async fn handle_connection_windows(
         }
     };
 
-    let resp = dispatch(req, &db, &names).await;
+    let resp = dispatch(req, &db, &names, &index).await;
     writer.write_all(resp.to_json_line()?.as_bytes()).await?;
     Ok(())
 }
@@ -145,6 +153,7 @@ async fn dispatch(
     req: Request,
     db: &DbCache,
     names: &tokio::sync::RwLock<Arc<Names>>,
+    index: &SearchIndex,
 ) -> Response {
     use crate::ipc::Request::*;
     use super::query;
@@ -172,7 +181,7 @@ async fn dispatch(
             }
         }
         Search { keyword, chats, limit, since, until, msg_type } => {
-            match query::q_search(db, &names_arc, &keyword, chats, limit, since, until, msg_type).await {
+            match query::q_search(db, &names_arc, index, &keyword, chats, limit, since, until, msg_type).await {
                 Ok(v) => Response::ok(v),
                 Err(e) => Response::err(e.to_string()),
             }
@@ -209,6 +218,24 @@ async fn dispatch(
         }
         Stats { chat, since, until } => {
             match query::q_stats(db, &names_arc, &chat, since, until).await {
+                Ok(v) => Response::ok(v),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Moments { limit, user, since, until, query: q, with_media } => {
+            match query::q_moments(db, &names_arc, limit, user, since, until, q, with_media).await {
+                Ok(v) => Response::ok(v),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        MomentsInbox { limit, since, until, unread_only } => {
+            match query::q_moments_inbox(db, &names_arc, limit, since, until, unread_only).await {
+                Ok(v) => Response::ok(v),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        FriendRequests { limit, since, until, direction } => {
+            match query::q_friend_requests(db, &names_arc, limit, since, until, direction).await {
                 Ok(v) => Response::ok(v),
                 Err(e) => Response::err(e.to_string()),
             }

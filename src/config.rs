@@ -179,12 +179,30 @@ fn detect_db_dir_impl() -> Option<PathBuf> {
             }
         }
     }
-    candidates.sort_by_key(|p| {
-        std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    });
+    candidates.sort_by_key(|p| latest_db_mtime(p));
     candidates.into_iter().next_back()
+}
+
+/// 返回 db_storage 下 session.db / session.db-wal 等"热"文件的最新 mtime，
+/// 用于判断哪个账号是当前活跃账号。
+fn latest_db_mtime(db_storage: &std::path::Path) -> std::time::SystemTime {
+    let mut latest = std::time::SystemTime::UNIX_EPOCH;
+    // 只看 session 目录下的文件，便宜且 session.db-wal 每次消息都会更新
+    let session_dir = db_storage.join("session");
+    if let Ok(entries) = std::fs::read_dir(&session_dir) {
+        for entry in entries.flatten() {
+            if let Ok(m) = entry.metadata().and_then(|m| m.modified()) {
+                if m > latest { latest = m; }
+            }
+        }
+    }
+    // fallback: 用 db_storage 本身的 mtime
+    if latest == std::time::SystemTime::UNIX_EPOCH {
+        latest = std::fs::metadata(db_storage)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    }
+    latest
 }
 
 #[cfg(target_os = "linux")]

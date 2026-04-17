@@ -235,6 +235,7 @@ pub async fn q_history(
 pub async fn q_search(
     db: &DbCache,
     names: &Names,
+    index: &super::search_index::SearchIndex,
     keyword: &str,
     chats: Option<Vec<String>>,
     limit: usize,
@@ -242,6 +243,29 @@ pub async fn q_search(
     until: Option<i64>,
     msg_type: Option<i64>,
 ) -> Result<Value> {
+    // 查询 ≥ 3 字符时走 FTS 索引（trigram tokenizer 限制）
+    if keyword.chars().count() >= 3 {
+        // 确保索引是最新的（首次会慢，之后增量都是毫秒）
+        match index.sync(db, names).await {
+            Ok(n) if n > 0 => eprintln!("[search] 索引新增 {} 条消息", n),
+            Ok(_) => {},
+            Err(e) => eprintln!("[search] 索引同步失败（降级 LIKE）: {}", e),
+        }
+        // 解析 chats → usernames（如果指定）
+        let chat_unames: Option<Vec<String>> = chats.as_ref().map(|v| {
+            v.iter().filter_map(|n| resolve_username(n, names)).collect()
+        });
+        if let Ok(Some(hits)) = index.search(keyword, chat_unames, names, since, until, msg_type, limit).await {
+            return Ok(json!({
+                "keyword": keyword,
+                "count": hits.len(),
+                "results": hits,
+                "backend": "fts",
+            }));
+        }
+    }
+
+    // 降级：原有 LIKE 实现
     let mut targets: Vec<(String, String, String, String)> = Vec::new(); // (path, table, display, uname)
 
     if let Some(chat_names) = chats {
@@ -802,7 +826,12 @@ fn extract_xml_text(xml: &str, tag: &str) -> Option<String> {
     let start = xml.find(&open)?;
     let content_start = start + open.len();
     let end = xml[content_start..].find(&close)?;
-    Some(xml[content_start..content_start + end].trim().to_string())
+    let raw = xml[content_start..content_start + end].trim();
+    // 剥掉 CDATA 包装（公众号链接的 title/des 常见）
+    let stripped = raw.strip_prefix("<![CDATA[")
+        .and_then(|s| s.strip_suffix("]]>"))
+        .unwrap_or(raw);
+    Some(stripped.trim().to_string())
 }
 
 fn unescape_html(s: &str) -> String {
@@ -1502,3 +1531,382 @@ pub async fn q_stats(
     }))
 }
 
+
+// ─── 朋友圈（Moments / SNS） ───────────────────────────────────────────────────
+
+/// 查询朋友圈时间线。数据来自 `sns/sns.db` 的 `SnsTimeLine` 表，
+/// `content` 字段是 `<SnsDataItem><TimelineObject>...</TimelineObject></SnsDataItem>` XML。
+pub async fn q_moments(
+    db: &DbCache,
+    names: &Names,
+    limit: usize,
+    user: Option<String>,
+    since: Option<i64>,
+    until: Option<i64>,
+    query: Option<String>,
+    with_media: bool,
+) -> Result<Value> {
+    let path = db.get("sns/sns.db").await?
+        .context("无法解密 sns.db（朋友圈数据库）")?;
+
+    // 先按 user 参数解析出 target username（如指定）
+    let target_uname: Option<String> = user.as_deref()
+        .and_then(|u| resolve_username(u, names));
+
+    let user_arg = user.clone();
+    let target_clone = target_uname.clone();
+    let query_clone = query.clone();
+
+    let rows: Vec<(i64, String, String)> = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(&path)?;
+        let mut clauses: Vec<&'static str> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(u) = target_clone.as_ref() {
+            clauses.push("user_name = ?");
+            params.push(Box::new(u.clone()));
+        }
+
+        let where_clause = if clauses.is_empty() { String::new() }
+            else { format!("WHERE {}", clauses.join(" AND ")) };
+        // 比 limit 多取几倍，因为还要按 since/until/query 二次过滤
+        // SnsTimeLine 的 tid 是 DESC 主键，近似按时间倒序（但 createTime 在 XML 里才精确）
+        let fetch_cap = std::cmp::max(limit * 5, 200);
+        params.push(Box::new(fetch_cap as i64));
+
+        let sql = format!(
+            "SELECT tid, user_name, content FROM SnsTimeLine {} ORDER BY tid DESC LIMIT ?",
+            where_clause
+        );
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<(i64, String, String)> = stmt.query_map(params_ref.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0).unwrap_or(0),
+                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, String>(2).unwrap_or_default(),
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+        Ok::<_, anyhow::Error>(rows)
+    }).await??;
+
+    // 如果用户指定了 user 但没解析到 target，给个友好错误
+    if user_arg.is_some() && target_uname.is_none() {
+        anyhow::bail!("找不到联系人: {}", user_arg.unwrap());
+    }
+
+    let like = query_clone.as_ref().map(|q| q.to_lowercase());
+    let mut out: Vec<Value> = Vec::new();
+    for (_tid, uname, content) in rows {
+        let parsed = match parse_moment(&content) {
+            Some(m) => m,
+            None => continue,
+        };
+
+        // 时间过滤
+        if let Some(s) = since {
+            if parsed.create_time < s { continue; }
+        }
+        if let Some(u) = until {
+            if parsed.create_time > u { continue; }
+        }
+        // 关键词过滤
+        if let Some(ref kw) = like {
+            if !parsed.text.to_lowercase().contains(kw) { continue; }
+        }
+
+        let author_uname = if !parsed.username.is_empty() { &parsed.username } else { &uname };
+        let mut obj = serde_json::Map::new();
+        obj.insert("id".into(), json!(parsed.id));
+        obj.insert("author".into(), json!(names.display(author_uname)));
+        obj.insert("username".into(), json!(author_uname.clone()));
+        obj.insert("time".into(), json!(fmt_time(parsed.create_time, "%Y-%m-%d %H:%M")));
+        obj.insert("timestamp".into(), json!(parsed.create_time));
+        obj.insert("type".into(), json!(parsed.kind));
+        obj.insert("text".into(), json!(parsed.text));
+        if !parsed.link.is_empty() {
+            obj.insert("link".into(), json!(parsed.link));
+        }
+        if with_media && !parsed.media.is_empty() {
+            obj.insert("media".into(), json!(parsed.media));
+        } else if !parsed.media.is_empty() {
+            obj.insert("media_count".into(), json!(parsed.media.len()));
+        }
+        out.push(Value::Object(obj));
+
+        if out.len() >= limit { break; }
+    }
+
+    // 精确按 createTime 倒序（tid 不完全等于 time）
+    out.sort_by_key(|m| std::cmp::Reverse(m["timestamp"].as_i64().unwrap_or(0)));
+    Ok(json!({ "count": out.len(), "moments": out }))
+}
+
+struct ParsedMoment {
+    id: String,
+    username: String,
+    create_time: i64,
+    text: String,
+    kind: String,        // text / photos / video / link / share / unknown
+    link: String,        // ContentObject.contentUrl（分享/链接类才有）
+    media: Vec<String>,  // 缩略图或视频 URL
+}
+
+fn parse_moment(xml: &str) -> Option<ParsedMoment> {
+    let id = extract_xml_text(xml, "id").unwrap_or_default();
+    let username = extract_xml_text(xml, "username").unwrap_or_default();
+    let create_time: i64 = extract_xml_text(xml, "createTime")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let text = extract_xml_text(xml, "contentDesc").unwrap_or_default();
+
+    // ContentObject 里才有真正的 type
+    let content_obj = extract_tag_block(xml, "ContentObject").unwrap_or_default();
+    let type_num: i64 = extract_xml_text(&content_obj, "type")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // WeChat 给所有 moments 的 ContentObject 都塞了一个升级占位 URL（page/common_page__upgrade），
+    // 那不是真实分享链接，过滤掉
+    let link_raw = extract_xml_text(&content_obj, "contentUrl").unwrap_or_default();
+    let link = if link_raw.contains("common_page__upgrade") { String::new() } else { link_raw };
+
+    // 抓图片/视频缩略图 URL。media 标签里 thumb 可能是纯文本 URL 也可能带 key/enc_idx 属性
+    let mut media: Vec<String> = Vec::new();
+    let media_block = extract_tag_block(&content_obj, "mediaList").unwrap_or_default();
+    let mut rest = media_block.as_str();
+    while let Some(start) = rest.find("<thumb") {
+        let after = &rest[start..];
+        // 找到 thumb 标签结束位置
+        let tag_close = after.find('>')?;
+        let after_open = &after[tag_close + 1..];
+        // 再找 </thumb>
+        if let Some(end) = after_open.find("</thumb>") {
+            let url = after_open[..end].trim();
+            if !url.is_empty() {
+                media.push(unescape_html(url));
+            }
+            rest = &after_open[end + "</thumb>".len()..];
+        } else {
+            break;
+        }
+    }
+
+    if id.is_empty() && create_time == 0 && text.is_empty() && media.is_empty() {
+        return None;
+    }
+    // 类型判断：先按 type_num，再根据实际内容兜底，避免被空 ContentObject 误判
+    let kind = moment_type_str(type_num, !media.is_empty(), !link.is_empty()).to_string();
+    Some(ParsedMoment { id, username, create_time, text, kind, link, media })
+}
+
+/// 提取 `<tag>...</tag>` 的内部块（保留子标签，不做 CDATA 剥离）
+fn extract_tag_block(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(&open)?;
+    let content_start = start + open.len();
+    let end = xml[content_start..].find(&close)?;
+    Some(xml[content_start..content_start + end].to_string())
+}
+
+/// ContentObject.type 映射（观察到的常见值，未知返回 "unknown"）
+///   1=分享链接 / 2=图片 / 3=文字 / 4=音乐 / 5=视频分享 / 15=小视频 / 其他...
+/// 同时用 has_media / has_link 兜底：type 不可靠时按实际内容判断
+fn moment_type_str(t: i64, has_media: bool, has_link: bool) -> &'static str {
+    match t {
+        15 => "video",
+        4 | 5 => "music",
+        _ if has_link => "link",
+        _ if has_media => "photos",
+        _ => "text",
+    }
+}
+
+/// 查询朋友圈收件箱（别人对我的评论/点赞通知）。
+/// 数据来自 `sns/sns.db` 的 `SnsMessage_tmp3` 表。
+/// type 映射：1=点赞 / 2=评论 / 其他。
+pub async fn q_moments_inbox(
+    db: &DbCache,
+    names: &Names,
+    limit: usize,
+    since: Option<i64>,
+    until: Option<i64>,
+    unread_only: bool,
+) -> Result<Value> {
+    let path = db.get("sns/sns.db").await?
+        .context("无法解密 sns.db")?;
+
+    let rows: Vec<(i64, i64, String, String, String, String, String, i64, i64)>
+        = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(&path)?;
+        let mut clauses: Vec<&'static str> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(s) = since { clauses.push("create_time >= ?"); params.push(Box::new(s)); }
+        if let Some(u) = until { clauses.push("create_time <= ?"); params.push(Box::new(u)); }
+        if unread_only { clauses.push("is_unread = 1"); }
+        let where_clause = if clauses.is_empty() { String::new() }
+            else { format!("WHERE {}", clauses.join(" AND ")) };
+        params.push(Box::new(limit as i64));
+
+        let sql = format!(
+            "SELECT create_time, type, from_username, from_nickname, \
+                    to_username, to_nickname, content, feed_id, is_unread \
+             FROM SnsMessage_tmp3 {} ORDER BY create_time DESC LIMIT ?",
+            where_clause
+        );
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<_> = stmt.query_map(params_ref.as_slice(), |r| Ok((
+            r.get::<_, i64>(0).unwrap_or(0),
+            r.get::<_, i64>(1).unwrap_or(0),
+            r.get::<_, String>(2).unwrap_or_default(),
+            r.get::<_, String>(3).unwrap_or_default(),
+            r.get::<_, String>(4).unwrap_or_default(),
+            r.get::<_, String>(5).unwrap_or_default(),
+            r.get::<_, String>(6).unwrap_or_default(),
+            r.get::<_, i64>(7).unwrap_or(0),
+            r.get::<_, i64>(8).unwrap_or(0),
+        )))?.filter_map(|r| r.ok()).collect();
+        Ok::<_, anyhow::Error>(rows)
+    }).await??;
+
+    let out: Vec<Value> = rows.into_iter().map(|(ts, typ, from_u, from_n, to_u, to_n, content, feed_id, unread)| {
+        let action = match typ {
+            1 => "like",
+            2 => "comment",
+            _ => "other",
+        };
+        // 优先用 contacts 解析到的显示名（带备注），fallback 到 SNS 表里的 nickname
+        let from_disp = if !from_u.is_empty() && names.map.contains_key(&from_u) {
+            names.display(&from_u)
+        } else { from_n.clone() };
+        let to_disp = if !to_u.is_empty() && names.map.contains_key(&to_u) {
+            names.display(&to_u)
+        } else { to_n.clone() };
+
+        let mut obj = serde_json::Map::new();
+        obj.insert("time".into(), json!(fmt_time(ts, "%Y-%m-%d %H:%M")));
+        obj.insert("timestamp".into(), json!(ts));
+        obj.insert("action".into(), json!(action));
+        obj.insert("from".into(), json!(from_disp));
+        obj.insert("from_username".into(), json!(from_u));
+        obj.insert("to".into(), json!(to_disp));
+        obj.insert("feed_id".into(), json!(feed_id.to_string()));
+        if !content.is_empty() {
+            obj.insert("content".into(), json!(content));
+        }
+        if unread != 0 {
+            obj.insert("unread".into(), json!(true));
+        }
+        Value::Object(obj)
+    }).collect();
+
+    Ok(json!({ "count": out.len(), "inbox": out }))
+}
+
+/// 查询好友申请历史（来自 general.db 的 FMessageTable）。
+/// type=37 常规好友申请；scene_ 表示添加途径。
+pub async fn q_friend_requests(
+    db: &DbCache,
+    names: &Names,
+    limit: usize,
+    since: Option<i64>,
+    until: Option<i64>,
+    direction: Option<String>,
+) -> Result<Value> {
+    let path = db.get("general/general.db").await?
+        .context("无法解密 general.db")?;
+
+    let dir_filter: Option<i64> = match direction.as_deref() {
+        Some("incoming") | Some("received") => Some(0),
+        Some("outgoing") | Some("sent")     => Some(1),
+        _ => None,
+    };
+
+    let rows: Vec<(String, i64, i64, String, i64, i64, String)>
+        = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(&path)?;
+        let mut clauses: Vec<&'static str> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(s) = since { clauses.push("timestamp_ >= ?"); params.push(Box::new(s)); }
+        if let Some(u) = until { clauses.push("timestamp_ <= ?"); params.push(Box::new(u)); }
+        if let Some(d) = dir_filter { clauses.push("is_sender_ = ?"); params.push(Box::new(d)); }
+        let where_clause = if clauses.is_empty() { String::new() }
+            else { format!("WHERE {}", clauses.join(" AND ")) };
+        params.push(Box::new(limit as i64));
+
+        let sql = format!(
+            "SELECT user_name_, type_, timestamp_, content_, is_sender_, scene_, remark_ \
+             FROM FMessageTable {} ORDER BY timestamp_ DESC LIMIT ?",
+            where_clause
+        );
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<_> = stmt.query_map(params_ref.as_slice(), |r| Ok((
+            r.get::<_, String>(0).unwrap_or_default(),
+            r.get::<_, i64>(1).unwrap_or(0),
+            r.get::<_, i64>(2).unwrap_or(0),
+            r.get::<_, String>(3).unwrap_or_default(),
+            r.get::<_, i64>(4).unwrap_or(0),
+            r.get::<_, i64>(5).unwrap_or(0),
+            r.get::<_, String>(6).unwrap_or_default(),
+        )))?.filter_map(|r| r.ok()).collect();
+        Ok::<_, anyhow::Error>(rows)
+    }).await??;
+
+    let out: Vec<Value> = rows.into_iter().map(|(uname, type_, ts, content, is_sender, scene, remark)| {
+        let direction = if is_sender == 1 { "outgoing" } else { "incoming" };
+        // 已成为好友的话能解析到显示名
+        let display = if names.map.contains_key(&uname) { names.display(&uname) }
+            else { uname.clone() };
+        let mut obj = serde_json::Map::new();
+        obj.insert("time".into(), json!(fmt_time(ts, "%Y-%m-%d %H:%M")));
+        obj.insert("timestamp".into(), json!(ts));
+        obj.insert("direction".into(), json!(direction));
+        obj.insert("contact".into(), json!(display));
+        obj.insert("username".into(), json!(uname.clone()));
+        obj.insert("content".into(), json!(content));
+        obj.insert("scene".into(), json!(scene_str(scene)));
+        obj.insert("type".into(), json!(fm_type_str(type_)));
+        if !remark.is_empty() {
+            obj.insert("remark".into(), json!(remark));
+        }
+        obj.insert("now_friend".into(), json!(names.map.contains_key(&uname)));
+        Value::Object(obj)
+    }).collect();
+
+    Ok(json!({ "count": out.len(), "requests": out }))
+}
+
+/// 添加场景（FMessageTable.scene_）→ 中文描述
+fn scene_str(s: i64) -> &'static str {
+    match s {
+        1  => "QQ好友",
+        3  => "微信号搜索",
+        6  => "QQ群",
+        7  => "群聊",
+        8  => "扫一扫",
+        14 => "群聊",
+        15 => "名片分享",
+        17 => "附近的人/摇一摇",
+        18 => "雷达",
+        22 => "手机联系人",
+        25 => "漂流瓶",
+        27 => "搜索手机号",
+        29 => "附近的人",
+        30 => "手机通讯录",
+        _  => "其他",
+    }
+}
+
+fn fm_type_str(t: i64) -> &'static str {
+    match t {
+        37 => "好友申请",
+        38 => "推荐名片",
+        40 => "认证回复",
+        65 => "申请通过",
+        _  => "其他",
+    }
+}

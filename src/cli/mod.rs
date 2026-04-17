@@ -12,6 +12,9 @@ pub mod members;
 pub mod new_messages;
 pub mod stats;
 pub mod favorites;
+pub mod moments;
+pub mod moments_inbox;
+pub mod friend_requests;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -181,6 +184,68 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// 查看朋友圈
+    Moments {
+        /// 显示数量
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+        /// 限定发布人（支持备注/昵称/wxid 模糊匹配）
+        #[arg(short = 'u', long)]
+        user: Option<String>,
+        /// 起始时间 YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束时间 YYYY-MM-DD
+        #[arg(long)]
+        until: Option<String>,
+        /// 关键词搜索（匹配正文）
+        #[arg(short = 'q', long)]
+        query: Option<String>,
+        /// 附带媒体 URL 列表（图片/视频缩略图）
+        #[arg(long)]
+        with_media: bool,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 朋友圈消息（别人评论/点赞我的通知）
+    #[command(name = "moments-inbox")]
+    MomentsInbox {
+        /// 显示数量
+        #[arg(short = 'n', long, default_value = "50")]
+        limit: usize,
+        /// 起始时间 YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束时间 YYYY-MM-DD
+        #[arg(long)]
+        until: Option<String>,
+        /// 只看未读
+        #[arg(long)]
+        unread_only: bool,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 好友申请历史
+    #[command(name = "friend-requests")]
+    FriendRequests {
+        /// 显示数量
+        #[arg(short = 'n', long, default_value = "50")]
+        limit: usize,
+        /// 起始时间 YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束时间 YYYY-MM-DD
+        #[arg(long)]
+        until: Option<String>,
+        /// 方向过滤：incoming / outgoing（默认全部）
+        #[arg(long, value_parser = ["incoming", "outgoing", "received", "sent"])]
+        direction: Option<String>,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
     /// 管理 wx-daemon
     Daemon {
         #[command(subcommand)]
@@ -235,6 +300,15 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         Commands::Favorites { limit, fav_type, query, json } => {
             favorites::cmd_favorites(limit, fav_type, query, json)
+        }
+        Commands::Moments { limit, user, since, until, query, with_media, json } => {
+            moments::cmd_moments(limit, user, since, until, query, with_media, json)
+        }
+        Commands::MomentsInbox { limit, since, until, unread_only, json } => {
+            moments_inbox::cmd_moments_inbox(limit, since, until, unread_only, json)
+        }
+        Commands::FriendRequests { limit, since, until, direction, json } => {
+            friend_requests::cmd_friend_requests(limit, since, until, direction, json)
         }
         Commands::Daemon { cmd } => daemon_cmd::cmd_daemon(cmd),
     }
