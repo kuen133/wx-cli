@@ -8,9 +8,29 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org)
 
-会话 · 聊天记录 · 搜索 · 联系人 · 群成员 · 收藏 · 统计 · 导出
+会话 · 聊天记录 · 搜索 · 联系人 · 群成员 · 收藏 · 统计 · 导出 · **朋友圈**
 
 </div>
+
+---
+
+## 🍴 这是一个 fork
+
+Forked from **[jackwener/wx-cli](https://github.com/jackwener/wx-cli)** @ `v0.1.9` (commit `697d3fc`)，遵循 upstream 的 Apache-2.0 协议。感谢原作者的工作 🙏
+
+**本 fork 相对 upstream 的改动：**
+
+| 类型 | 改动 |
+|---|---|
+| 🐛 fix | WeChat 4.1.x 多账号场景下，upstream 检测错账号目录 → 修成按 `db_storage/session/` 内文件的最新 mtime 排 |
+| 🐛 fix | upstream 把 `biz_message_*.db` 过滤掉了，导致 `wx history "公众号名"` 报"找不到消息记录" → 加回来 |
+| 🐛 fix | 链接标题输出被 `<![CDATA[...]]>` 包着 → 剥掉 |
+| ✨ feat | `wx moments` 查朋友圈（文字/媒体/过滤） |
+| ✨ feat | `wx moments-inbox` 别人评论/点赞我的通知 |
+| ✨ feat | `wx friend-requests` 好友申请历史（申请话术、来源、方向） |
+| ⚡ perf | `wx search` 25-40× 提速：自建 trigram FTS5 索引（upstream 用 LIKE 全表扫；微信的 `message_fts.db` 用私有 `MMFtsTokenizer`，标准 SQLite 打不开） |
+
+看详细变更：[commit log](../../commits) · [原始 upstream](https://github.com/jackwener/wx-cli)
 
 ---
 
