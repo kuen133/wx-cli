@@ -9,7 +9,8 @@
 /// 1. 需要以 root (sudo) 运行
 /// 2. WeChat 需要进行 ad-hoc 签名
 /// 3. 在内存中搜索 x'<64hex><32hex>' 格式的 SQLCipher 密钥
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
+use std::collections::HashSet;
 use std::path::Path;
 
 use super::{collect_db_salts, KeyEntry};
@@ -77,18 +78,74 @@ extern "C" {
     ) -> kern_return_t;
 }
 
-/// 查找 WeChat 进程的 PID
-fn find_wechat_pid() -> Option<libc::pid_t> {
-    // 使用 pgrep -x WeChat 查找（与 C 版本一致）
-    let output = std::process::Command::new("pgrep")
-        .args(["-x", "WeChat"])
-        .output()
-        .ok()?;
+fn collect_pids(args: &[&str], out: &mut Vec<libc::pid_t>, seen: &mut HashSet<libc::pid_t>) {
+    let output = match std::process::Command::new("pgrep").args(args).output() {
+        Ok(output) => output,
+        Err(_) => return,
+    };
     if !output.status.success() {
-        return None;
+        return;
     }
-    let s = String::from_utf8_lossy(&output.stdout);
-    s.trim().parse().ok()
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let Ok(pid) = line.trim().parse::<libc::pid_t>() else {
+            continue;
+        };
+        if pid > 0 && seen.insert(pid) {
+            out.push(pid);
+        }
+    }
+}
+
+/// 查找可能持有 WeChat 数据库密钥的进程 PID。
+///
+/// 微信 4.x 在不同版本/机器上，密钥不一定只驻留在主进程 `WeChat`，
+/// 也可能位于 `WeChatAppEx`。这里按确定性顺序返回候选 PID。
+fn find_wechat_pids() -> Vec<libc::pid_t> {
+    let mut pids = Vec::new();
+    let mut seen = HashSet::new();
+
+    for args in [
+        &["-x", "WeChat"][..],
+        &["-x", "WeChatAppEx"][..],
+        &["-x", "微信"][..],
+        &["-f", "/WeChat\\.app/Contents/MacOS/WeChat($| )"][..],
+        &["-f", "/WeChatAppEx\\.app/Contents/MacOS/WeChatAppEx($| )"][..],
+    ] {
+        collect_pids(args, &mut pids, &mut seen);
+    }
+
+    pids
+}
+
+fn task_port_for_pid(pid: libc::pid_t) -> Result<mach_port_t> {
+    // SAFETY: task_for_pid 是标准 Mach API，参数合法
+    unsafe {
+        let mut task: mach_port_t = 0;
+        let kr = task_for_pid(mach_task_self(), pid, &mut task);
+        if kr != KERN_SUCCESS {
+            bail!(
+                "task_for_pid 失败 (pid={}, kr={})。请按以下步骤修复：\n\
+                \n\
+                  1. 对 WeChat 重新签名（只需做一次）：\n\
+                     codesign --force --deep --sign - /Applications/WeChat.app\n\
+                \n\
+                  2. 重启 WeChat：\n\
+                     killall WeChat && open /Applications/WeChat.app\n\
+                \n\
+                  3. 确认已经真正登录到聊天主界面后，再次运行（需要 root）：\n\
+                     sudo wx init\n\
+                \n\
+                如果 codesign 报 \"signature in use\"，先执行：\n\
+                     codesign --remove-signature /Applications/WeChat.app/Contents/Frameworks/vlc_plugins/librtp_mpeg4_plugin.dylib\n\
+                     codesign --force --deep --sign - /Applications/WeChat.app",
+                pid,
+                kr
+            );
+        }
+        Ok(task)
+    }
 }
 
 /// 判断字节是否是 ASCII 十六进制字符
@@ -98,50 +155,66 @@ fn is_hex_char(c: u8) -> bool {
 }
 
 pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
-    // 1. 查找 WeChat PID
-    let pid = find_wechat_pid()
-        .context("找不到 WeChat 进程，请确认 WeChat 正在运行")?;
-    eprintln!("WeChat PID: {}", pid);
+    // 1. 查找可能持有密钥的 WeChat 进程
+    let pids = find_wechat_pids();
+    if pids.is_empty() {
+        anyhow::bail!("找不到 WeChat 进程，请确认 WeChat 正在运行");
+    }
+    eprintln!("找到候选 WeChat PID: {:?}", pids);
 
-    // 2. 获取 task port
-    // SAFETY: task_for_pid 是标准 Mach API，参数合法
-    let task = unsafe {
-        let mut task: mach_port_t = 0;
-        let kr = task_for_pid(mach_task_self(), pid, &mut task);
-        if kr != KERN_SUCCESS {
-            bail!(
-                "task_for_pid 失败 (kr={})。请按以下步骤修复：\n\
-                \n\
-                  1. 对 WeChat 重新签名（只需做一次）：\n\
-                     codesign --force --deep --sign - /Applications/WeChat.app\n\
-                \n\
-                  2. 重启 WeChat：\n\
-                     killall WeChat && open /Applications/WeChat.app\n\
-                \n\
-                  3. 再次运行（需要 root）：\n\
-                     sudo wx init\n\
-                \n\
-                如果 codesign 报 \"signature in use\"，先执行：\n\
-                     codesign --remove-signature /Applications/WeChat.app/Contents/Frameworks/vlc_plugins/librtp_mpeg4_plugin.dylib\n\
-                     codesign --force --deep --sign - /Applications/WeChat.app",
-                kr
-            );
-        }
-        task
-    };
-    eprintln!("Got task port: {}", task);
-
-    // 3. 收集数据库 salt 映射
+    // 2. 收集数据库 salt 映射
     eprintln!("扫描数据库文件...");
     let db_salts = collect_db_salts(db_dir);
     eprintln!("找到 {} 个加密数据库", db_salts.len());
 
-    // 4. 扫描进程内存
+    // 3. 扫描所有候选进程内存，并合并去重后的候选密钥
     eprintln!("扫描进程内存寻找密钥...");
-    let raw_keys = scan_memory(task)?;
-    eprintln!("找到 {} 个候选密钥", raw_keys.len());
+    let mut raw_keys = Vec::new();
+    let mut raw_seen = HashSet::new();
+    let mut task_errors = Vec::new();
 
-    // 5. 将密钥与数据库 salt 匹配
+    for pid in pids {
+        eprintln!("尝试扫描 PID {} ...", pid);
+        let task = match task_port_for_pid(pid) {
+            Ok(task) => task,
+            Err(err) => {
+                eprintln!("PID {} 无法获取 task port: {}", pid, err);
+                task_errors.push(err.to_string());
+                continue;
+            }
+        };
+        eprintln!("PID {} task port: {}", pid, task);
+
+        let pid_keys = scan_memory(task)?;
+        eprintln!("PID {} 找到 {} 个候选密钥", pid, pid_keys.len());
+        for pair in pid_keys {
+            if raw_seen.insert(pair.clone()) {
+                raw_keys.push(pair);
+            }
+        }
+    }
+
+    if raw_keys.is_empty() && !task_errors.is_empty() {
+        return Err(anyhow!(task_errors.join("\n\n")));
+    }
+    eprintln!("合并后共有 {} 个候选密钥", raw_keys.len());
+
+    if raw_keys.is_empty() {
+        bail!(
+            "未在 WeChat 进程内存中发现任何 SQLCipher 密钥。\n\
+            \n\
+            这通常意味着：\n\
+              1. 微信虽然已启动，但尚未真正进入聊天主界面；\n\
+              2. 当前账号数据库还没有被加载到进程内存；\n\
+              3. 需要重新签名并重启 WeChat；\n\
+              4. 当前 WeChat / macOS 版本的密钥驻留形式发生了变化。\n\
+            \n\
+            请先确认微信已经登录并显示聊天列表，再执行：\n\
+              sudo wx init --force"
+        );
+    }
+
+    // 4. 将密钥与数据库 salt 匹配
     let mut entries = Vec::new();
     for (key_hex, salt_hex) in &raw_keys {
         for (db_salt, db_name) in &db_salts {
@@ -157,6 +230,15 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
     }
 
     eprintln!("匹配到 {}/{} 个密钥", entries.len(), raw_keys.len());
+
+    if entries.is_empty() {
+        bail!(
+            "已扫描到候选密钥，但没有任何密钥能匹配当前 db_dir 下的数据库 salt。\n\
+            \n\
+            请确认当前配置的 db_dir 属于已登录的那个微信账号；如果刚切换过账号，建议重新运行：\n\
+              sudo wx init --force"
+        );
+    }
     Ok(entries)
 }
 
