@@ -23,6 +23,15 @@ pub enum Request {
         until: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         msg_type: Option<i64>,
+        #[serde(default)]
+        with_asr: bool,
+    },
+    Transfers {
+        chat: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
     },
     Search {
         keyword: String,

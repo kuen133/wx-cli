@@ -190,6 +190,11 @@ impl DbCache {
         self.save_persistent().await;
         Ok(Some(out_path))
     }
+
+    /// 返回当前缓存管理的所有数据库相对路径键。
+    pub fn keys(&self) -> Vec<String> {
+        self.all_keys.keys().cloned().collect()
+    }
 }
 
 pub(super) fn mtime_nanos(path: &Path) -> u64 {

@@ -174,8 +174,14 @@ async fn dispatch(
                 Err(e) => Response::err(e.to_string()),
             }
         }
-        History { chat, limit, offset, since, until, msg_type } => {
-            match query::q_history(db, &names_arc, &chat, limit, offset, since, until, msg_type).await {
+        History { chat, limit, offset, since, until, msg_type, with_asr } => {
+            match query::q_history(db, &names_arc, &chat, limit, offset, since, until, msg_type, with_asr).await {
+                Ok(v) => Response::ok(v),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Transfers { chat, since, until } => {
+            match query::q_transfers(db, &names_arc, &chat, since, until).await {
                 Ok(v) => Response::ok(v),
                 Err(e) => Response::err(e.to_string()),
             }

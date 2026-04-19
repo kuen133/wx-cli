@@ -10,13 +10,22 @@ pub fn cmd_history(
     since: Option<String>,
     until: Option<String>,
     msg_type: Option<String>,
+    with_asr: bool,
     json: bool,
 ) -> Result<()> {
     let since_ts = since.as_deref().map(parse_time).transpose()?;
     let until_ts = until.as_deref().map(parse_time_end).transpose()?;
     let type_val = msg_type.as_deref().and_then(parse_msg_type);
 
-    let req = Request::History { chat, limit, offset, since: since_ts, until: until_ts, msg_type: type_val };
+    let req = Request::History {
+        chat,
+        limit,
+        offset,
+        since: since_ts,
+        until: until_ts,
+        msg_type: type_val,
+        with_asr,
+    };
     let resp = transport::send(req)?;
 
     let msgs = resp.data.get("messages")

@@ -21,6 +21,7 @@ pub fn cmd_export(
         since: since_ts,
         until: until_ts,
         msg_type: None,
+        with_asr: false,
     };
 
     let resp = transport::send(req)?;

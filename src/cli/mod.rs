@@ -15,6 +15,8 @@ pub mod favorites;
 pub mod moments;
 pub mod moments_inbox;
 pub mod friend_requests;
+pub mod transfers;
+pub mod asr_backfill;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -64,6 +66,48 @@ enum Commands {
         #[arg(long = "type", value_name = "TYPE",
               value_parser = ["text","image","voice","video","sticker","location","link","file","call","system"])]
         msg_type: Option<String>,
+        /// 对尚未缓存的语音消息调用百炼 ASR；已缓存的语音会自动显示文字
+        #[arg(long)]
+        with_asr: bool,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 查看某个联系人的转账台账与月度汇总
+    Transfers {
+        /// 联系人名称（支持模糊匹配）
+        chat: String,
+        /// 快速筛选月份 YYYY-MM（例如 2026-04）
+        #[arg(long, conflicts_with_all = ["since", "until"])]
+        month: Option<String>,
+        /// 起始时间 YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束时间 YYYY-MM-DD
+        #[arg(long)]
+        until: Option<String>,
+        /// 只输出汇总表，不输出逐笔明细
+        #[arg(long)]
+        summary_only: bool,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 全量预转写历史语音到本地缓存，后续查聊天记录时可直接显示文字
+    #[command(name = "asr-backfill")]
+    AsrBackfill {
+        /// 起始时间 YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束时间 YYYY-MM-DD
+        #[arg(long)]
+        until: Option<String>,
+        /// 最多处理前 N 条语音消息（按时间升序）
+        #[arg(short = 'n', long)]
+        limit: Option<usize>,
+        /// 只统计待处理数量、时长和预估费用，不实际调用在线 ASR
+        #[arg(long)]
+        dry_run: bool,
         /// 输出 JSON（默认 YAML）
         #[arg(long)]
         json: bool,
@@ -282,8 +326,14 @@ fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init { force } => init::cmd_init(force),
         Commands::Sessions { limit, json } => sessions::cmd_sessions(limit, json),
-        Commands::History { chat, limit, offset, since, until, msg_type, json } => {
-            history::cmd_history(chat, limit, offset, since, until, msg_type, json)
+        Commands::History { chat, limit, offset, since, until, msg_type, with_asr, json } => {
+            history::cmd_history(chat, limit, offset, since, until, msg_type, with_asr, json)
+        }
+        Commands::Transfers { chat, month, since, until, summary_only, json } => {
+            transfers::cmd_transfers(chat, month, since, until, summary_only, json)
+        }
+        Commands::AsrBackfill { since, until, limit, dry_run, json } => {
+            asr_backfill::cmd_asr_backfill(limit, since, until, dry_run, json)
         }
         Commands::Search { keyword, chats, limit, since, until, msg_type, json } => {
             search::cmd_search(keyword, chats, limit, since, until, msg_type, json)

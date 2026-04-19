@@ -2,6 +2,7 @@ pub mod cache;
 pub mod query;
 pub mod server;
 pub mod search_index;
+pub mod voice_asr;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -98,7 +99,7 @@ async fn async_run() -> Result<()> {
 /// 兼容两种格式：
 /// - `{ "rel/path.db": { "enc_key": "hex" } }`（Python 版原生格式）
 /// - `{ "rel/path.db": "hex" }`（简化格式）
-fn extract_keys(json: &serde_json::Value) -> HashMap<String, String> {
+pub(crate) fn extract_keys(json: &serde_json::Value) -> HashMap<String, String> {
     let mut result = HashMap::new();
     if let Some(obj) = json.as_object() {
         for (k, v) in obj {
