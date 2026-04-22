@@ -68,10 +68,14 @@ fn parse_month_range(s: &str) -> Result<(Option<i64>, Option<i64>)> {
         .and_then(|d| d.and_hms_opt(0, 0, 0))
         .context("无法构造下个月起始时间")?;
 
-    let since = Local.from_local_datetime(&start).single()
+    let since = Local
+        .from_local_datetime(&start)
+        .single()
         .map(|d| d.timestamp())
         .ok_or_else(|| anyhow::anyhow!("本地时间歧义: {}-{:02}", year, month))?;
-    let until = Local.from_local_datetime(&next).single()
+    let until = Local
+        .from_local_datetime(&next)
+        .single()
         .map(|d| d.timestamp() - 1)
         .ok_or_else(|| anyhow::anyhow!("本地时间歧义: {}-{:02}", next_year, next_month))?;
 

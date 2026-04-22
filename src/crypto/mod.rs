@@ -1,9 +1,9 @@
 pub mod wal;
 
-use anyhow::{bail, Result};
 use aes::Aes256;
-use cbc::Decryptor;
+use anyhow::{bail, Result};
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use cbc::Decryptor;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -65,11 +65,8 @@ fn aes_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Result<Vec<u8>
         bail!("密文长度不是 AES 块大小的倍数: {}", data.len());
     }
     // 将 &[u8] 复制为 Block 数组，避免 unsafe from_raw_parts_mut
-    let mut blocks: Vec<Block> = data.chunks_exact(16)
-        .map(Block::clone_from_slice)
-        .collect();
-    Aes256CbcDec::new(key.into(), iv.into())
-        .decrypt_blocks_mut(&mut blocks);
+    let mut blocks: Vec<Block> = data.chunks_exact(16).map(Block::clone_from_slice).collect();
+    Aes256CbcDec::new(key.into(), iv.into()).decrypt_blocks_mut(&mut blocks);
     Ok(blocks.iter().flat_map(|b| b.iter().copied()).collect())
 }
 
@@ -93,7 +90,9 @@ pub fn full_decrypt(db_path: &Path, out_path: &Path, enc_key: &[u8; 32]) -> Resu
 
     for pgno in 1..=total_pages {
         let n = input.read(&mut page_buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         // 不足一页则补零
         if n < PAGE_SZ {
             page_buf[n..].fill(0);

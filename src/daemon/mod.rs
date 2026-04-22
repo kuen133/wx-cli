@@ -1,7 +1,7 @@
 pub mod cache;
 pub mod query;
-pub mod server;
 pub mod search_index;
+pub mod server;
 pub mod voice_asr;
 
 use anyhow::Result;
@@ -41,7 +41,8 @@ async fn async_run() -> Result<()> {
     eprintln!("[daemon] DB_DIR: {}", cfg.db_dir.display());
 
     // 加载密钥
-    let keys_content = tokio::fs::read_to_string(&cfg.keys_file).await
+    let keys_content = tokio::fs::read_to_string(&cfg.keys_file)
+        .await
         .map_err(|e| anyhow::anyhow!("读取密钥文件 {:?} 失败: {}", cfg.keys_file, e))?;
     let keys_raw: serde_json::Value = serde_json::from_str(&keys_content)?;
     let all_keys = extract_keys(&keys_raw);
@@ -53,11 +54,13 @@ async fn async_run() -> Result<()> {
     // 收集消息 DB 列表
     // - message/message_N.db: 普通聊天（私聊、群聊）
     // - message/biz_message_N.db: 公众号/服务号消息
-    let msg_db_keys: Vec<String> = all_keys.keys()
+    let msg_db_keys: Vec<String> = all_keys
+        .keys()
         .filter(|k| {
             let k = k.replace('\\', "/");
             k.ends_with(".db")
-                && !k.contains("_fts") && !k.contains("_resource")
+                && !k.contains("_fts")
+                && !k.contains("_resource")
                 && (k.contains("message/message_") || k.contains("message/biz_message_"))
         })
         .cloned()
@@ -103,7 +106,9 @@ pub(crate) fn extract_keys(json: &serde_json::Value) -> HashMap<String, String> 
     let mut result = HashMap::new();
     if let Some(obj) = json.as_object() {
         for (k, v) in obj {
-            if k.starts_with('_') { continue; }
+            if k.starts_with('_') {
+                continue;
+            }
             let enc_key = if let Some(s) = v.as_str() {
                 s.to_string()
             } else if let Some(obj2) = v.as_object() {

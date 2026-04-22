@@ -35,10 +35,7 @@ pub struct DbCache {
 }
 
 impl DbCache {
-    pub async fn new(
-        db_dir: PathBuf,
-        all_keys: HashMap<String, String>,
-    ) -> Result<Self> {
+    pub async fn new(db_dir: PathBuf, all_keys: HashMap<String, String>) -> Result<Self> {
         let cache_dir = config::cache_dir();
         tokio::fs::create_dir_all(&cache_dir).await?;
 
@@ -78,18 +75,29 @@ impl DbCache {
             if !dec_path.exists() {
                 continue;
             }
-            let db_path = self.db_dir.join(rel_key.replace('\\', std::path::MAIN_SEPARATOR_STR).replace('/', std::path::MAIN_SEPARATOR_STR));
+            let db_path = self.db_dir.join(
+                rel_key
+                    .replace('\\', std::path::MAIN_SEPARATOR_STR)
+                    .replace('/', std::path::MAIN_SEPARATOR_STR),
+            );
             let wal_path = wal_path_for(&db_path);
 
             let db_mt = mtime_nanos(&db_path);
-            let wal_mt = if wal_path.exists() { mtime_nanos(&wal_path) } else { 0 };
+            let wal_mt = if wal_path.exists() {
+                mtime_nanos(&wal_path)
+            } else {
+                0
+            };
 
             if db_mt == entry.db_mt && wal_mt == entry.wal_mt {
-                inner.insert(rel_key.clone(), CacheEntry {
-                    db_mtime: db_mt,
-                    wal_mtime: wal_mt,
-                    decrypted_path: dec_path,
-                });
+                inner.insert(
+                    rel_key.clone(),
+                    CacheEntry {
+                        db_mtime: db_mt,
+                        wal_mtime: wal_mt,
+                        decrypted_path: dec_path,
+                    },
+                );
                 reused += 1;
             }
         }
@@ -102,13 +110,19 @@ impl DbCache {
     async fn save_persistent(&self) {
         let mtime_file = config::mtime_file();
         let inner = self.inner.lock().await;
-        let data: HashMap<String, MtimeEntry> = inner.iter().map(|(k, v)| {
-            (k.clone(), MtimeEntry {
-                db_mt: v.db_mtime,
-                wal_mt: v.wal_mtime,
-                path: v.decrypted_path.to_string_lossy().into_owned(),
+        let data: HashMap<String, MtimeEntry> = inner
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    MtimeEntry {
+                        db_mt: v.db_mtime,
+                        wal_mt: v.wal_mtime,
+                        path: v.decrypted_path.to_string_lossy().into_owned(),
+                    },
+                )
             })
-        }).collect();
+            .collect();
         drop(inner);
 
         if let Ok(json) = serde_json::to_string_pretty(&data) {
@@ -126,8 +140,9 @@ impl DbCache {
         };
 
         let db_path = self.db_dir.join(
-            rel_key.replace('\\', std::path::MAIN_SEPARATOR_STR)
-                   .replace('/', std::path::MAIN_SEPARATOR_STR)
+            rel_key
+                .replace('\\', std::path::MAIN_SEPARATOR_STR)
+                .replace('/', std::path::MAIN_SEPARATOR_STR),
         );
         if !db_path.exists() {
             return Ok(None);
@@ -136,7 +151,11 @@ impl DbCache {
         let wal_path = wal_path_for(&db_path);
 
         let db_mt = mtime_nanos(&db_path);
-        let wal_mt = if wal_path.exists() { mtime_nanos(&wal_path) } else { 0 };
+        let wal_mt = if wal_path.exists() {
+            mtime_nanos(&wal_path)
+        } else {
+            0
+        };
 
         // 检查缓存
         {
@@ -153,25 +172,23 @@ impl DbCache {
 
         // 需要重新解密
         let out_path = self.cache_file_path(rel_key);
-        let enc_key_bytes = hex_to_32bytes(&enc_key_hex)
-            .with_context(|| format!("密钥格式错误: {}", rel_key))?;
+        let enc_key_bytes =
+            hex_to_32bytes(&enc_key_hex).with_context(|| format!("密钥格式错误: {}", rel_key))?;
 
         let t0 = std::time::Instant::now();
         let db_path2 = db_path.clone();
         let out_path2 = out_path.clone();
         let key_copy = enc_key_bytes;
-        tokio::task::spawn_blocking(move || {
-            crypto::full_decrypt(&db_path2, &out_path2, &key_copy)
-        }).await??;
+        tokio::task::spawn_blocking(move || crypto::full_decrypt(&db_path2, &out_path2, &key_copy))
+            .await??;
 
         // 应用 WAL
         if wal_path.exists() {
             let out_path3 = out_path.clone();
             let wal_path3 = wal_path.clone();
             let key_copy2 = enc_key_bytes;
-            tokio::task::spawn_blocking(move || {
-                wal::apply_wal(&wal_path3, &out_path3, &key_copy2)
-            }).await??;
+            tokio::task::spawn_blocking(move || wal::apply_wal(&wal_path3, &out_path3, &key_copy2))
+                .await??;
         }
 
         let elapsed_ms = t0.elapsed().as_millis();
@@ -180,11 +197,14 @@ impl DbCache {
         // 更新内存缓存
         {
             let mut inner = self.inner.lock().await;
-            inner.insert(rel_key.to_string(), CacheEntry {
-                db_mtime: db_mt,
-                wal_mtime: wal_mt,
-                decrypted_path: out_path.clone(),
-            });
+            inner.insert(
+                rel_key.to_string(),
+                CacheEntry {
+                    db_mtime: db_mt,
+                    wal_mtime: wal_mt,
+                    decrypted_path: out_path.clone(),
+                },
+            );
         }
 
         self.save_persistent().await;
@@ -200,7 +220,11 @@ impl DbCache {
 pub(super) fn mtime_nanos(path: &Path) -> u64 {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
-        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64)
+        .map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64
+        })
         .unwrap_or(0)
 }
 

@@ -4,30 +4,28 @@ use super::transport;
 use crate::ipc::Request;
 use anyhow::Result;
 
-pub fn cmd_moments(
+pub fn cmd_sns_search(
+    keyword: String,
     limit: usize,
-    user: Option<String>,
     since: Option<String>,
     until: Option<String>,
-    query: Option<String>,
-    with_media: bool,
+    user: Option<String>,
     json: bool,
 ) -> Result<()> {
     let since_ts = since.as_deref().map(parse_time).transpose()?;
     let until_ts = until.as_deref().map(parse_time_end).transpose()?;
 
-    let req = Request::Moments {
+    let req = Request::SnsSearch {
+        keyword,
         limit,
-        user,
         since: since_ts,
         until: until_ts,
-        query,
-        with_media,
+        user,
     };
     let resp = transport::send(req)?;
     let data = resp
         .data
-        .get("moments")
+        .get("posts")
         .cloned()
         .unwrap_or(serde_json::Value::Array(vec![]));
     print_value(&data, &resolve(json))

@@ -1,22 +1,25 @@
-mod init;
-pub mod sessions;
-pub mod history;
-pub mod search;
+pub mod asr_backfill;
 pub mod contacts;
-pub mod export;
 pub mod daemon_cmd;
-pub mod transport;
-pub mod output;
-pub mod unread;
-pub mod members;
-pub mod new_messages;
-pub mod stats;
+pub mod export;
 pub mod favorites;
+pub mod friend_requests;
+pub mod history;
+mod init;
+pub mod members;
 pub mod moments;
 pub mod moments_inbox;
-pub mod friend_requests;
+pub mod new_messages;
+pub mod output;
+pub mod search;
+pub mod sessions;
+pub mod sns_feed;
+pub mod sns_notifications;
+pub mod sns_search;
+pub mod stats;
 pub mod transfers;
-pub mod asr_backfill;
+pub mod transport;
+pub mod unread;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -271,6 +274,62 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// 朋友圈互动通知：别人对我的朋友圈点赞/评论 + 我评过的帖子下的跟帖
+    SnsNotifications {
+        /// 显示数量
+        #[arg(short = 'n', long, default_value = "50")]
+        limit: usize,
+        /// 起始时间 YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束时间 YYYY-MM-DD
+        #[arg(long)]
+        until: Option<String>,
+        /// 包含已读通知（默认仅未读）
+        #[arg(long)]
+        include_read: bool,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 朋友圈时间线：按时间/作者筛选本地缓存的朋友圈
+    SnsFeed {
+        /// 显示数量
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+        /// 起始时间 YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束时间 YYYY-MM-DD
+        #[arg(long)]
+        until: Option<String>,
+        /// 只看指定作者（昵称 / 备注名 / 微信 ID，模糊匹配）
+        #[arg(long)]
+        user: Option<String>,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 朋友圈全文搜索：匹配正文关键词
+    SnsSearch {
+        /// 关键词
+        keyword: String,
+        /// 结果数量
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+        /// 起始时间 YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束时间 YYYY-MM-DD
+        #[arg(long)]
+        until: Option<String>,
+        /// 限定作者（昵称 / 备注名 / 微信 ID）
+        #[arg(long)]
+        user: Option<String>,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
     /// 好友申请历史
     #[command(name = "friend-requests")]
     FriendRequests {
@@ -326,40 +385,113 @@ fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init { force } => init::cmd_init(force),
         Commands::Sessions { limit, json } => sessions::cmd_sessions(limit, json),
-        Commands::History { chat, limit, offset, since, until, msg_type, with_asr, json } => {
-            history::cmd_history(chat, limit, offset, since, until, msg_type, with_asr, json)
-        }
-        Commands::Transfers { chat, month, since, until, summary_only, json } => {
-            transfers::cmd_transfers(chat, month, since, until, summary_only, json)
-        }
-        Commands::AsrBackfill { since, until, limit, dry_run, json } => {
-            asr_backfill::cmd_asr_backfill(limit, since, until, dry_run, json)
-        }
-        Commands::Search { keyword, chats, limit, since, until, msg_type, json } => {
-            search::cmd_search(keyword, chats, limit, since, until, msg_type, json)
-        }
+        Commands::History {
+            chat,
+            limit,
+            offset,
+            since,
+            until,
+            msg_type,
+            with_asr,
+            json,
+        } => history::cmd_history(chat, limit, offset, since, until, msg_type, with_asr, json),
+        Commands::Transfers {
+            chat,
+            month,
+            since,
+            until,
+            summary_only,
+            json,
+        } => transfers::cmd_transfers(chat, month, since, until, summary_only, json),
+        Commands::AsrBackfill {
+            since,
+            until,
+            limit,
+            dry_run,
+            json,
+        } => asr_backfill::cmd_asr_backfill(limit, since, until, dry_run, json),
+        Commands::Search {
+            keyword,
+            chats,
+            limit,
+            since,
+            until,
+            msg_type,
+            json,
+        } => search::cmd_search(keyword, chats, limit, since, until, msg_type, json),
         Commands::Contacts { query, limit, json } => contacts::cmd_contacts(query, limit, json),
-        Commands::Export { chat, since, until, limit, format, output } => {
-            export::cmd_export(chat, since, until, limit, format, output)
-        }
-        Commands::Unread { limit, filter, json } => unread::cmd_unread(limit, filter, json),
+        Commands::Export {
+            chat,
+            since,
+            until,
+            limit,
+            format,
+            output,
+        } => export::cmd_export(chat, since, until, limit, format, output),
+        Commands::Unread {
+            limit,
+            filter,
+            json,
+        } => unread::cmd_unread(limit, filter, json),
         Commands::Members { chat, json } => members::cmd_members(chat, json),
         Commands::NewMessages { limit, json } => new_messages::cmd_new_messages(limit, json),
-        Commands::Stats { chat, since, until, json } => {
-            stats::cmd_stats(chat, since, until, json)
-        }
-        Commands::Favorites { limit, fav_type, query, json } => {
-            favorites::cmd_favorites(limit, fav_type, query, json)
-        }
-        Commands::Moments { limit, user, since, until, query, with_media, json } => {
-            moments::cmd_moments(limit, user, since, until, query, with_media, json)
-        }
-        Commands::MomentsInbox { limit, since, until, unread_only, json } => {
-            moments_inbox::cmd_moments_inbox(limit, since, until, unread_only, json)
-        }
-        Commands::FriendRequests { limit, since, until, direction, json } => {
-            friend_requests::cmd_friend_requests(limit, since, until, direction, json)
-        }
+        Commands::Stats {
+            chat,
+            since,
+            until,
+            json,
+        } => stats::cmd_stats(chat, since, until, json),
+        Commands::Favorites {
+            limit,
+            fav_type,
+            query,
+            json,
+        } => favorites::cmd_favorites(limit, fav_type, query, json),
+        Commands::Moments {
+            limit,
+            user,
+            since,
+            until,
+            query,
+            with_media,
+            json,
+        } => moments::cmd_moments(limit, user, since, until, query, with_media, json),
+        Commands::MomentsInbox {
+            limit,
+            since,
+            until,
+            unread_only,
+            json,
+        } => moments_inbox::cmd_moments_inbox(limit, since, until, unread_only, json),
+        Commands::SnsNotifications {
+            limit,
+            since,
+            until,
+            include_read,
+            json,
+        } => sns_notifications::cmd_sns_notifications(limit, since, until, include_read, json),
+        Commands::SnsFeed {
+            limit,
+            since,
+            until,
+            user,
+            json,
+        } => sns_feed::cmd_sns_feed(limit, since, until, user, json),
+        Commands::SnsSearch {
+            keyword,
+            limit,
+            since,
+            until,
+            user,
+            json,
+        } => sns_search::cmd_sns_search(keyword, limit, since, until, user, json),
+        Commands::FriendRequests {
+            limit,
+            since,
+            until,
+            direction,
+            json,
+        } => friend_requests::cmd_friend_requests(limit, since, until, direction, json),
         Commands::Daemon { cmd } => daemon_cmd::cmd_daemon(cmd),
     }
 }

@@ -25,9 +25,9 @@ impl SearchIndex {
     pub fn new(cache_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(cache_dir).ok();
         let path = cache_dir.join("_search_index.db");
-        let conn = Connection::open(&path)
-            .with_context(|| format!("open {:?}", path))?;
-        conn.execute_batch(r#"
+        let conn = Connection::open(&path).with_context(|| format!("open {:?}", path))?;
+        conn.execute_batch(
+            r#"
             PRAGMA journal_mode=WAL;
             CREATE VIRTUAL TABLE IF NOT EXISTS msg_fts USING fts5(
                 content,
@@ -42,7 +42,8 @@ impl SearchIndex {
                 chat_uname TEXT PRIMARY KEY,
                 max_time INTEGER NOT NULL
             );
-        "#)?;
+        "#,
+        )?;
         Ok(Self { path })
     }
 
@@ -175,12 +176,23 @@ impl SearchIndex {
                 if !chats.is_empty() {
                     let placeholders: Vec<&str> = chats.iter().map(|_| "?").collect();
                     clauses.push(format!("chat_uname IN ({})", placeholders.join(",")));
-                    for c in chats { params.push(Box::new(c)); }
+                    for c in chats {
+                        params.push(Box::new(c));
+                    }
                 }
             }
-            if let Some(s) = since { clauses.push("create_time >= ?".into()); params.push(Box::new(s)); }
-            if let Some(u) = until { clauses.push("create_time <= ?".into()); params.push(Box::new(u)); }
-            if let Some(t) = msg_type { clauses.push("local_type = ?".into()); params.push(Box::new(t)); }
+            if let Some(s) = since {
+                clauses.push("create_time >= ?".into());
+                params.push(Box::new(s));
+            }
+            if let Some(u) = until {
+                clauses.push("create_time <= ?".into());
+                params.push(Box::new(u));
+            }
+            if let Some(t) = msg_type {
+                clauses.push("local_type = ?".into());
+                params.push(Box::new(t));
+            }
 
             let sql = format!(
                 "SELECT content, chat_uname, sender_uname, local_id, create_time, local_type \
@@ -189,38 +201,51 @@ impl SearchIndex {
             );
             params.push(Box::new(limit as i64));
 
-            let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
             let mut stmt = conn.prepare(&sql)?;
-            let rows: Vec<Value> = stmt.query_map(params_ref.as_slice(), |r| Ok((
-                r.get::<_, String>(0).unwrap_or_default(),
-                r.get::<_, String>(1).unwrap_or_default(),
-                r.get::<_, String>(2).unwrap_or_default(),
-                r.get::<_, i64>(3).unwrap_or(0),
-                r.get::<_, i64>(4).unwrap_or(0),
-                r.get::<_, i64>(5).unwrap_or(0),
-            )))?
-            .filter_map(|r| r.ok())
-            .map(|(content, chat_uname, sender_uname, local_id, ts, local_type)| {
-                let chat_display = names_map.get(&chat_uname).cloned().unwrap_or_else(|| chat_uname.clone());
-                let sender_display = if sender_uname.is_empty() {
-                    String::new()
-                } else {
-                    names_map.get(&sender_uname).cloned().unwrap_or_else(|| sender_uname.clone())
-                };
-                json!({
-                    "chat": chat_display,
-                    "chat_uname": chat_uname,
-                    "sender": sender_display,
-                    "local_id": local_id,
-                    "timestamp": ts,
-                    "time": fmt_ts(ts),
-                    "type": fmt_local_type(local_type),
-                    "content": content,
-                })
-            })
-            .collect();
+            let rows: Vec<Value> = stmt
+                .query_map(params_ref.as_slice(), |r| {
+                    Ok((
+                        r.get::<_, String>(0).unwrap_or_default(),
+                        r.get::<_, String>(1).unwrap_or_default(),
+                        r.get::<_, String>(2).unwrap_or_default(),
+                        r.get::<_, i64>(3).unwrap_or(0),
+                        r.get::<_, i64>(4).unwrap_or(0),
+                        r.get::<_, i64>(5).unwrap_or(0),
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .map(
+                    |(content, chat_uname, sender_uname, local_id, ts, local_type)| {
+                        let chat_display = names_map
+                            .get(&chat_uname)
+                            .cloned()
+                            .unwrap_or_else(|| chat_uname.clone());
+                        let sender_display = if sender_uname.is_empty() {
+                            String::new()
+                        } else {
+                            names_map
+                                .get(&sender_uname)
+                                .cloned()
+                                .unwrap_or_else(|| sender_uname.clone())
+                        };
+                        json!({
+                            "chat": chat_display,
+                            "chat_uname": chat_uname,
+                            "sender": sender_display,
+                            "local_id": local_id,
+                            "timestamp": ts,
+                            "time": fmt_ts(ts),
+                            "type": fmt_local_type(local_type),
+                            "content": content,
+                        })
+                    },
+                )
+                .collect();
             Ok(rows)
-        }).await??;
+        })
+        .await??;
 
         Ok(Some(res))
     }
@@ -234,7 +259,8 @@ fn msg_table_re() -> regex::Regex {
 fn load_id2u(conn: &Connection) -> HashMap<i64, String> {
     let mut map = HashMap::new();
     if let Ok(mut stmt) = conn.prepare("SELECT rowid, user_name FROM Name2Id") {
-        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
+        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        {
             for r in rows.flatten() {
                 map.insert(r.0, r.1);
             }
@@ -255,7 +281,9 @@ fn decompress_message(data: &[u8], ct: i64) -> String {
 
 fn fmt_ts(ts: i64) -> String {
     use chrono::{Local, TimeZone};
-    Local.timestamp_opt(ts, 0).single()
+    Local
+        .timestamp_opt(ts, 0)
+        .single()
         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| ts.to_string())
 }
@@ -263,9 +291,19 @@ fn fmt_ts(ts: i64) -> String {
 fn fmt_local_type(t: i64) -> String {
     static MAP: OnceLock<HashMap<i64, &'static str>> = OnceLock::new();
     let m = MAP.get_or_init(|| {
-        [(1,"文本"),(3,"图片"),(34,"语音"),(43,"视频"),(47,"表情"),
-         (48,"位置"),(49,"链接/文件"),(50,"通话"),(10000,"系统")]
-            .into_iter().collect()
+        [
+            (1, "文本"),
+            (3, "图片"),
+            (34, "语音"),
+            (43, "视频"),
+            (47, "表情"),
+            (48, "位置"),
+            (49, "链接/文件"),
+            (50, "通话"),
+            (10000, "系统"),
+        ]
+        .into_iter()
+        .collect()
     });
     m.get(&t).copied().unwrap_or("其他").to_string()
 }

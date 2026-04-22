@@ -11,8 +11,8 @@ use std::sync::OnceLock;
 
 use crate::config;
 
-use super::query::Names;
 use super::cache::DbCache;
+use super::query::Names;
 
 const DEFAULT_ASR_LANGUAGE: &str = "zh";
 const DEFAULT_ASR_MODEL: &str = "qwen3-asr-flash";
@@ -306,7 +306,10 @@ async fn load_voice_blob(
         };
 
         let chat = chat_username.to_string();
-        let blob = tokio::task::spawn_blocking(move || query_voice_blob(&path, &chat, local_id, create_time)).await??;
+        let blob = tokio::task::spawn_blocking(move || {
+            query_voice_blob(&path, &chat, local_id, create_time)
+        })
+        .await??;
         if blob.is_some() {
             return Ok(blob);
         }
@@ -384,10 +387,7 @@ fn decode_silk_to_wav(voice_blob: &[u8]) -> Result<Vec<u8>> {
         .with_context(|| format!("启动 silk 解码器失败: {}", decoder_bin.display()))?;
 
     {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .context("无法打开 silk 解码器 stdin")?;
+        let stdin = child.stdin.as_mut().context("无法打开 silk 解码器 stdin")?;
         stdin.write_all(voice_blob)?;
     }
 
@@ -488,15 +488,23 @@ fn transcribe_wav_with_bailian(
     let temp_path = temp_dir.join(temp_name);
     std::fs::write(&temp_path, wav_bytes)?;
 
-    let language = std::env::var("WX_ASR_LANGUAGE").unwrap_or_else(|_| DEFAULT_ASR_LANGUAGE.to_string());
-    let model_override = std::env::var("WX_ASR_MODEL").ok().filter(|s| !s.trim().is_empty());
+    let language =
+        std::env::var("WX_ASR_LANGUAGE").unwrap_or_else(|_| DEFAULT_ASR_LANGUAGE.to_string());
+    let model_override = std::env::var("WX_ASR_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
 
-    let output = run_python_asr(&script_path, &temp_path, &language, model_override.as_deref());
+    let output = run_python_asr(
+        &script_path,
+        &temp_path,
+        &language,
+        model_override.as_deref(),
+    );
     let _ = std::fs::remove_file(&temp_path);
     let output = output?;
 
-    let response: Value = serde_json::from_slice(&output.stdout)
-        .context("解析百炼 ASR 返回 JSON 失败")?;
+    let response: Value =
+        serde_json::from_slice(&output.stdout).context("解析百炼 ASR 返回 JSON 失败")?;
     let text = response
         .get("choices")
         .and_then(Value::as_array)
@@ -553,11 +561,7 @@ fn run_python_asr(
 
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                anyhow::bail!(
-                    "调用百炼 ASR 失败: {}\n{}",
-                    stderr.trim(),
-                    stdout.trim()
-                );
+                anyhow::bail!("调用百炼 ASR 失败: {}\n{}", stderr.trim(), stdout.trim());
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 last_err = Some(format!("找不到 Python 解释器: {}", candidate));

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone, Timelike};
 use regex::Regex;
+use roxmltree::{Document, Node};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -60,7 +61,10 @@ pub struct Names {
 
 impl Names {
     pub fn display(&self, username: &str) -> String {
-        self.map.get(username).cloned().unwrap_or_else(|| username.to_string())
+        self.map
+            .get(username)
+            .cloned()
+            .unwrap_or_else(|| username.to_string())
     }
 
     /// 是否被微信官方标了认证/服务号 flag。未在 contact 表中的 username 返回 false。
@@ -78,67 +82,83 @@ pub async fn load_names(db: &DbCache) -> Result<Names> {
         let p2 = p.clone();
         let rows: Vec<(String, String, String, i64)> = tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&p2).context("打开 contact.db 失败")?;
-            let mut stmt = conn.prepare(
-                "SELECT username, nick_name, remark, verify_flag FROM contact"
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1).unwrap_or_default(),
-                    row.get::<_, String>(2).unwrap_or_default(),
-                    row.get::<_, i64>(3).unwrap_or(0),
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut stmt =
+                conn.prepare("SELECT username, nick_name, remark, verify_flag FROM contact")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1).unwrap_or_default(),
+                        row.get::<_, String>(2).unwrap_or_default(),
+                        row.get::<_, i64>(3).unwrap_or(0),
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok::<_, anyhow::Error>(rows)
-        }).await??;
+        })
+        .await??;
 
         for (uname, nick, remark, vf) in rows {
-            let display = if !remark.is_empty() { remark }
-                else if !nick.is_empty() { nick }
-                else { uname.clone() };
+            let display = if !remark.is_empty() {
+                remark
+            } else if !nick.is_empty() {
+                nick
+            } else {
+                uname.clone()
+            };
             verify_flags.insert(uname.clone(), vf);
             map.insert(uname, display);
         }
     }
 
-    let md5_to_uname: HashMap<String, String> = map.keys()
+    let md5_to_uname: HashMap<String, String> = map
+        .keys()
         .map(|u| (format!("{:x}", md5::compute(u.as_bytes())), u.clone()))
         .collect();
 
-    Ok(Names { map, md5_to_uname, msg_db_keys: Vec::new(), verify_flags })
+    Ok(Names {
+        map,
+        md5_to_uname,
+        msg_db_keys: Vec::new(),
+        verify_flags,
+    })
 }
 
 /// 查询最近会话列表
 pub async fn q_sessions(db: &DbCache, names: &Names, limit: usize) -> Result<Value> {
-    let path = db.get("session/session.db").await?
+    let path = db
+        .get("session/session.db")
+        .await?
         .context("无法解密 session.db")?;
 
     let path2 = path.clone();
     let limit_val = limit;
-    let rows: Vec<(String, i64, Vec<u8>, i64, i64, String, String)> = tokio::task::spawn_blocking(move || {
-        let conn = Connection::open(&path2)?;
-        let mut stmt = conn.prepare(
-            "SELECT username, unread_count, summary, last_timestamp,
+    let rows: Vec<(String, i64, Vec<u8>, i64, i64, String, String)> =
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&path2)?;
+            let mut stmt = conn.prepare(
+                "SELECT username, unread_count, summary, last_timestamp,
                     last_msg_type, last_msg_sender, last_sender_display_name
              FROM SessionTable
              WHERE last_timestamp > 0
-             ORDER BY last_timestamp DESC LIMIT ?"
-        )?;
-        let rows = stmt.query_map([limit_val as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1).unwrap_or(0),
-                get_content_bytes(row, 2),
-                row.get::<_, i64>(3).unwrap_or(0),
-                row.get::<_, i64>(4).unwrap_or(0),
-                row.get::<_, String>(5).unwrap_or_default(),
-                row.get::<_, String>(6).unwrap_or_default(),
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok::<_, anyhow::Error>(rows)
-    }).await??;
+             ORDER BY last_timestamp DESC LIMIT ?",
+            )?;
+            let rows = stmt
+                .query_map([limit_val as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1).unwrap_or(0),
+                        get_content_bytes(row, 2),
+                        row.get::<_, i64>(3).unwrap_or(0),
+                        row.get::<_, i64>(4).unwrap_or(0),
+                        row.get::<_, String>(5).unwrap_or_default(),
+                        row.get::<_, String>(6).unwrap_or_default(),
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<_, anyhow::Error>(rows)
+        })
+        .await??;
 
     let mut results = Vec::new();
     for (username, unread, summary_bytes, ts, msg_type, sender, sender_name) in rows {
@@ -152,7 +172,11 @@ pub async fn q_sessions(db: &DbCache, names: &Names, limit: usize) -> Result<Val
 
         let sender_display = if is_group && !sender.is_empty() {
             names.map.get(&sender).cloned().unwrap_or_else(|| {
-                if !sender_name.is_empty() { sender_name.clone() } else { sender.clone() }
+                if !sender_name.is_empty() {
+                    sender_name.clone()
+                } else {
+                    sender.clone()
+                }
             })
         } else {
             String::new()
@@ -186,8 +210,8 @@ pub async fn q_history(
     msg_type: Option<i64>,
     with_asr: bool,
 ) -> Result<Value> {
-    let username = resolve_username(chat, names)
-        .with_context(|| format!("找不到联系人: {}", chat))?;
+    let username =
+        resolve_username(chat, names).with_context(|| format!("找不到联系人: {}", chat))?;
     let display = names.display(&username);
     let chat_type = chat_type_of(&username, names);
     let is_group = chat_type == "group";
@@ -212,8 +236,12 @@ pub async fn q_history(
         let msgs: Vec<Value> = tokio::task::spawn_blocking(move || {
             // per-DB 软上限：offset + limit 已足够全局分页，避免大群全量加载
             let per_db_cap = offset2 + limit2;
-            query_messages(&path, &tname, &uname, is_group2, &names_map, since2, until2, msg_type, per_db_cap, 0)
-        }).await??;
+            query_messages(
+                &path, &tname, &uname, is_group2, &names_map, since2, until2, msg_type, per_db_cap,
+                0,
+            )
+        })
+        .await??;
 
         all_msgs.extend(msgs);
     }
@@ -340,8 +368,8 @@ pub async fn q_transfers(
     since: Option<i64>,
     until: Option<i64>,
 ) -> Result<Value> {
-    let username = resolve_username(chat, names)
-        .with_context(|| format!("找不到联系人: {}", chat))?;
+    let username =
+        resolve_username(chat, names).with_context(|| format!("找不到联系人: {}", chat))?;
     let display = names.display(&username);
     let chat_type = chat_type_of(&username, names);
 
@@ -378,12 +406,15 @@ pub async fn q_transfers(
         let uname = username.clone();
         let msgs = tokio::task::spawn_blocking(move || {
             query_transfer_messages(&path, &tname, &uname, since, until)
-        }).await??;
+        })
+        .await??;
         all_msgs.extend(msgs);
     }
 
     let summary = summarize_transfer_messages(&username, all_msgs);
-    let monthly_rows: Vec<Value> = summary.monthly.iter()
+    let monthly_rows: Vec<Value> = summary
+        .monthly
+        .iter()
         .map(|(period, bucket)| bucket.to_value(period))
         .collect();
 
@@ -427,14 +458,19 @@ pub async fn q_search(
         // 确保索引是最新的（首次会慢，之后增量都是毫秒）
         match index.sync(db, names).await {
             Ok(n) if n > 0 => eprintln!("[search] 索引新增 {} 条消息", n),
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => eprintln!("[search] 索引同步失败（降级 LIKE）: {}", e),
         }
         // 解析 chats → usernames（如果指定）
         let chat_unames: Option<Vec<String>> = chats.as_ref().map(|v| {
-            v.iter().filter_map(|n| resolve_username(n, names)).collect()
+            v.iter()
+                .filter_map(|n| resolve_username(n, names))
+                .collect()
         });
-        if let Ok(Some(hits)) = index.search(keyword, chat_unames, names, since, until, msg_type, limit).await {
+        if let Ok(Some(hits)) = index
+            .search(keyword, chat_unames, names, since, until, msg_type, limit)
+            .await
+        {
             return Ok(json!({
                 "keyword": keyword,
                 "count": hits.len(),
@@ -452,7 +488,12 @@ pub async fn q_search(
             if let Some(uname) = resolve_username(chat_name, names) {
                 let tables = find_msg_tables(db, names, &uname).await?;
                 for (p, t) in tables {
-                    targets.push((p.to_string_lossy().into_owned(), t, names.display(&uname), uname.clone()));
+                    targets.push((
+                        p.to_string_lossy().into_owned(),
+                        t,
+                        names.display(&uname),
+                        uname.clone(),
+                    ));
                 }
             }
         }
@@ -467,41 +508,49 @@ pub async fn q_search(
             let md5_lookup = names.md5_to_uname.clone();
             let names_map = names.map.clone();
 
-            let table_targets: Vec<(String, String, String, String)> = match tokio::task::spawn_blocking(move || {
-                let conn = Connection::open(&path2)?;
-                let mut stmt = conn.prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
-                )?;
-                let table_names: Vec<String> = stmt.query_map([], |row| row.get(0))?
-                    .filter_map(|r| r.ok())
-                    .collect();
+            let table_targets: Vec<(String, String, String, String)> =
+                match tokio::task::spawn_blocking(move || {
+                    let conn = Connection::open(&path2)?;
+                    let mut stmt = conn.prepare(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'",
+                    )?;
+                    let table_names: Vec<String> = stmt
+                        .query_map([], |row| row.get(0))?
+                        .filter_map(|r| r.ok())
+                        .collect();
 
-                let re = msg_table_re();
-                let mut result = Vec::new();
-                for tname in table_names {
-                    if !re.is_match(&tname) {
+                    let re = msg_table_re();
+                    let mut result = Vec::new();
+                    for tname in table_names {
+                        if !re.is_match(&tname) {
+                            continue;
+                        }
+                        let hash = &tname[4..];
+                        let uname = md5_lookup.get(hash).cloned().unwrap_or_default();
+                        let display = if uname.is_empty() {
+                            String::new()
+                        } else {
+                            names_map
+                                .get(&uname)
+                                .cloned()
+                                .unwrap_or_else(|| uname.clone())
+                        };
+                        result.push((path2.to_string_lossy().into_owned(), tname, display, uname));
+                    }
+                    Ok::<_, anyhow::Error>(result)
+                })
+                .await
+                {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        eprintln!("[search] skip DB {}: {}", rel_key, e);
                         continue;
                     }
-                    let hash = &tname[4..];
-                    let uname = md5_lookup.get(hash).cloned().unwrap_or_default();
-                    let display = if uname.is_empty() {
-                        String::new()
-                    } else {
-                        names_map.get(&uname).cloned().unwrap_or_else(|| uname.clone())
-                    };
-                    result.push((
-                        path2.to_string_lossy().into_owned(),
-                        tname,
-                        display,
-                        uname,
-                    ));
-                }
-                Ok::<_, anyhow::Error>(result)
-            }).await {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => { eprintln!("[search] skip DB {}: {}", rel_key, e); continue; }
-                Err(e) => { eprintln!("[search] task error {}: {}", rel_key, e); continue; }
-            };
+                    Err(e) => {
+                        eprintln!("[search] task error {}: {}", rel_key, e);
+                        continue;
+                    }
+                };
 
             targets.extend(table_targets);
         }
@@ -527,16 +576,35 @@ pub async fn q_search(
             let mut all = Vec::new();
             for (tname, display, uname) in &table_list {
                 let is_group = uname.contains("@chatroom");
-                match search_in_table(&conn, tname, &uname, is_group,
-                    &names_map2, &kw2, since2, until2, msg_type, limit2)
-                {
+                match search_in_table(
+                    &conn,
+                    tname,
+                    &uname,
+                    is_group,
+                    &names_map2,
+                    &kw2,
+                    since2,
+                    until2,
+                    msg_type,
+                    limit2,
+                ) {
                     Ok(rows) => {
                         for mut row in rows {
-                            if row.get("chat").map(|v| v.as_str().unwrap_or("")).unwrap_or("").is_empty() {
+                            if row
+                                .get("chat")
+                                .map(|v| v.as_str().unwrap_or(""))
+                                .unwrap_or("")
+                                .is_empty()
+                            {
                                 if let Some(obj) = row.as_object_mut() {
-                                    obj.insert("chat".into(), serde_json::Value::String(
-                                        if display.is_empty() { tname.clone() } else { display.clone() }
-                                    ));
+                                    obj.insert(
+                                        "chat".into(),
+                                        serde_json::Value::String(if display.is_empty() {
+                                            tname.clone()
+                                        } else {
+                                            display.clone()
+                                        }),
+                                    );
                                 }
                             }
                             all.push(row);
@@ -546,10 +614,18 @@ pub async fn q_search(
                 }
             }
             Ok::<_, anyhow::Error>(all)
-        }).await {
+        })
+        .await
+        {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => { eprintln!("[search] skip DB: {}", e); continue; }
-            Err(e) => { eprintln!("[search] task error: {}", e); continue; }
+            Ok(Err(e)) => {
+                eprintln!("[search] skip DB: {}", e);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("[search] task error: {}", e);
+                continue;
+            }
         };
 
         results.extend(found);
@@ -562,7 +638,9 @@ pub async fn q_search(
 
 /// 查询联系人
 pub async fn q_contacts(names: &Names, query: Option<&str>, limit: usize) -> Result<Value> {
-    let mut contacts: Vec<Value> = names.map.iter()
+    let mut contacts: Vec<Value> = names
+        .map
+        .iter()
         .filter(|(u, _)| !u.starts_with("gh_") && !u.starts_with("biz_"))
         .map(|(u, d)| json!({ "username": u, "display": d }))
         .collect();
@@ -570,13 +648,22 @@ pub async fn q_contacts(names: &Names, query: Option<&str>, limit: usize) -> Res
     if let Some(q) = query {
         let low = q.to_lowercase();
         contacts.retain(|c| {
-            c["display"].as_str().map(|s| s.to_lowercase().contains(&low)).unwrap_or(false)
-            || c["username"].as_str().map(|s| s.to_lowercase().contains(&low)).unwrap_or(false)
+            c["display"]
+                .as_str()
+                .map(|s| s.to_lowercase().contains(&low))
+                .unwrap_or(false)
+                || c["username"]
+                    .as_str()
+                    .map(|s| s.to_lowercase().contains(&low))
+                    .unwrap_or(false)
         });
     }
 
     contacts.sort_by(|a, b| {
-        a["display"].as_str().unwrap_or("").cmp(b["display"].as_str().unwrap_or(""))
+        a["display"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["display"].as_str().unwrap_or(""))
     });
 
     let total = contacts.len();
@@ -595,7 +682,9 @@ fn resolve_username(chat_name: &str, names: &Names) -> Option<String> {
     }
     let low = chat_name.to_lowercase();
     // 精确匹配显示名：排序后取第一个，保证确定性
-    let mut exact: Vec<&String> = names.map.iter()
+    let mut exact: Vec<&String> = names
+        .map
+        .iter()
         .filter(|(_, display)| display.to_lowercase() == low)
         .map(|(uname, _)| uname)
         .collect();
@@ -604,11 +693,16 @@ fn resolve_username(chat_name: &str, names: &Names) -> Option<String> {
         return Some(u.clone());
     }
     // 模糊匹配：取 display name 最短的（最精确），相同长度取字典序最小
-    let mut candidates: Vec<(&String, &String)> = names.map.iter()
+    let mut candidates: Vec<(&String, &String)> = names
+        .map
+        .iter()
         .filter(|(_, display)| display.to_lowercase().contains(&low))
         .collect();
     candidates.sort_by_key(|(uname, display)| (display.len(), uname.as_str()));
-    candidates.into_iter().next().map(|(uname, _)| uname.clone())
+    candidates
+        .into_iter()
+        .next()
+        .map(|(uname, _)| uname.clone())
 }
 
 async fn find_msg_tables(
@@ -631,21 +725,28 @@ async fn find_msg_tables(
         let path2 = path.clone();
         let max_ts: Option<i64> = tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&path2)?;
-            let table_exists: Option<i64> = conn.query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                [&tname],
-                |row| row.get(0),
-            ).ok().flatten();
+            let table_exists: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    [&tname],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
             if table_exists.is_none() {
                 return Ok::<_, anyhow::Error>(None);
             }
-            let ts: Option<i64> = conn.query_row(
-                &format!("SELECT MAX(create_time) FROM [{}]", tname),
-                [],
-                |row| row.get(0),
-            ).ok().flatten();
+            let ts: Option<i64> = conn
+                .query_row(
+                    &format!("SELECT MAX(create_time) FROM [{}]", tname),
+                    [],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
             Ok(ts)
-        }).await??;
+        })
+        .await??;
 
         if let Some(ts) = max_ts {
             results.push((ts, path.clone(), table_name.clone()));
@@ -704,23 +805,31 @@ fn query_messages(
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_ref.as_slice(), |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
-            get_content_bytes(row, 4),
-            row.get::<_, i64>(5).unwrap_or(0),
-        ))
-    })?
-    .filter_map(|r| r.ok())
-    .collect::<Vec<_>>();
+    let rows = stmt
+        .query_map(params_ref.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                get_content_bytes(row, 4),
+                row.get::<_, i64>(5).unwrap_or(0),
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
 
     let mut result = Vec::new();
     for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
         let content = decompress_message(&content_bytes, ct);
-        let sender = sender_label(real_sender_id, &content, is_group, chat_username, &id2u, names_map);
+        let sender = sender_label(
+            real_sender_id,
+            &content,
+            is_group,
+            chat_username,
+            &id2u,
+            names_map,
+        );
         let text = fmt_content(local_id, local_type, &content, is_group);
 
         result.push(json!({
@@ -765,17 +874,18 @@ fn query_transfer_messages(
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_ref.as_slice(), |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            get_content_bytes(row, 3),
-            row.get::<_, i64>(4).unwrap_or(0),
-        ))
-    })?
-    .filter_map(|r| r.ok())
-    .collect::<Vec<_>>();
+    let rows = stmt
+        .query_map(params_ref.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                get_content_bytes(row, 3),
+                row.get::<_, i64>(4).unwrap_or(0),
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
 
     let mut result = Vec::new();
     for (local_id, ts, real_sender_id, content_bytes, ct) in rows {
@@ -800,25 +910,37 @@ fn query_transfer_messages(
     Ok(result)
 }
 
-fn summarize_transfer_messages(chat_username: &str, messages: Vec<TransferMessage>) -> TransferSummary {
+fn summarize_transfer_messages(
+    chat_username: &str,
+    messages: Vec<TransferMessage>,
+) -> TransferSummary {
     let mut grouped: HashMap<String, Vec<TransferMessage>> = HashMap::new();
     for msg in messages {
-        grouped.entry(msg.app.transfer_id.clone()).or_default().push(msg);
+        grouped
+            .entry(msg.app.transfer_id.clone())
+            .or_default()
+            .push(msg);
     }
 
     let mut summary = TransferSummary::default();
     for (_, mut group) in grouped {
         group.sort_by_key(|msg| (msg.timestamp, msg.local_id));
 
-        let initiator = group.iter()
+        let initiator = group
+            .iter()
             .find(|msg| matches!(msg.app.paysubtype.as_str(), "1" | "8"));
         let Some(representative) = initiator else {
             let fallback = group.first();
-            let amount_cents = fallback.and_then(|msg| msg.app.amount_cents)
+            let amount_cents = fallback
+                .and_then(|msg| msg.app.amount_cents)
                 .or_else(|| group.iter().find_map(|msg| msg.app.amount_cents));
             let direction = fallback
                 .and_then(|msg| determine_transfer_direction(chat_username, msg))
-                .or_else(|| group.iter().find_map(|msg| determine_transfer_direction(chat_username, msg)));
+                .or_else(|| {
+                    group
+                        .iter()
+                        .find_map(|msg| determine_transfer_direction(chat_username, msg))
+                });
 
             let mut source_local_ids: Vec<i64> = group.iter().map(|msg| msg.local_id).collect();
             source_local_ids.sort_unstable();
@@ -839,10 +961,15 @@ fn summarize_transfer_messages(chat_username: &str, messages: Vec<TransferMessag
             continue;
         };
 
-        let amount_cents = representative.app.amount_cents
+        let amount_cents = representative
+            .app
+            .amount_cents
             .or_else(|| group.iter().find_map(|msg| msg.app.amount_cents));
-        let direction = determine_transfer_direction(chat_username, representative)
-            .or_else(|| group.iter().find_map(|msg| determine_transfer_direction(chat_username, msg)));
+        let direction = determine_transfer_direction(chat_username, representative).or_else(|| {
+            group
+                .iter()
+                .find_map(|msg| determine_transfer_direction(chat_username, msg))
+        });
 
         let (amount_cents, direction) = match (amount_cents, direction) {
             (Some(amount_cents), Some(direction)) => (amount_cents, direction),
@@ -856,7 +983,8 @@ fn summarize_transfer_messages(chat_username: &str, messages: Vec<TransferMessag
         source_local_ids.sort_unstable();
         source_local_ids.dedup();
         let period = fmt_time(representative.timestamp, "%Y-%m");
-        let final_subtype = group.iter()
+        let final_subtype = group
+            .iter()
             .rev()
             .find(|msg| !matches!(msg.app.paysubtype.as_str(), "1" | "8"))
             .map(|msg| msg.app.paysubtype.as_str())
@@ -865,7 +993,11 @@ fn summarize_transfer_messages(chat_username: &str, messages: Vec<TransferMessag
 
         if outcome == TransferOutcome::Completed {
             summary.summary.record(direction, amount_cents);
-            summary.monthly.entry(period.clone()).or_default().record(direction, amount_cents);
+            summary
+                .monthly
+                .entry(period.clone())
+                .or_default()
+                .record(direction, amount_cents);
         } else {
             summary.excluded_transfers.push(json!({
                 "time": fmt_time(representative.timestamp, "%Y-%m-%d %H:%M"),
@@ -899,8 +1031,12 @@ fn summarize_transfer_messages(chat_username: &str, messages: Vec<TransferMessag
         }));
     }
 
-    summary.transfers.sort_by_key(|item| item["timestamp"].as_i64().unwrap_or(0));
-    summary.excluded_transfers.sort_by_key(|item| item["timestamp"].as_i64().unwrap_or(0));
+    summary
+        .transfers
+        .sort_by_key(|item| item["timestamp"].as_i64().unwrap_or(0));
+    summary
+        .excluded_transfers
+        .sort_by_key(|item| item["timestamp"].as_i64().unwrap_or(0));
     summary
 }
 
@@ -913,7 +1049,10 @@ fn classify_transfer_outcome(final_subtype: &str) -> TransferOutcome {
     }
 }
 
-fn determine_transfer_direction(chat_username: &str, msg: &TransferMessage) -> Option<TransferDirection> {
+fn determine_transfer_direction(
+    chat_username: &str,
+    msg: &TransferMessage,
+) -> Option<TransferDirection> {
     if !msg.sender_username.is_empty() {
         return Some(if msg.sender_username == chat_username {
             TransferDirection::Received
@@ -955,8 +1094,7 @@ fn parse_transfer_appmsg_xml(text: &str) -> Option<TransferAppMsg> {
 
     let description = extract_xml_text(text, "des").unwrap_or_default();
     let feedesc = extract_xml_text(text, "feedesc").unwrap_or_default();
-    let amount_cents = parse_amount_cents(&feedesc)
-        .or_else(|| parse_amount_cents(&description));
+    let amount_cents = parse_amount_cents(&feedesc).or_else(|| parse_amount_cents(&description));
 
     Some(TransferAppMsg {
         transfer_id,
@@ -1020,7 +1158,12 @@ fn decimal_amount_to_cents(raw: &str) -> Option<i64> {
 fn format_cents(cents: i64) -> String {
     let sign = if cents < 0 { "-" } else { "" };
     let abs = cents.unsigned_abs();
-    format!("{}{whole}.{frac:02}", sign, whole = abs / 100, frac = abs % 100)
+    format!(
+        "{}{whole}.{frac:02}",
+        sign,
+        whole = abs / 100,
+        frac = abs % 100
+    )
 }
 
 fn format_cents_with_symbol(cents: i64) -> String {
@@ -1041,9 +1184,13 @@ fn search_in_table(
 ) -> Result<Vec<Value>> {
     let id2u = load_id2u(conn);
     // 转义 LIKE 通配符，使用 '\' 作为 ESCAPE 字符
-    let escaped_kw = keyword.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let escaped_kw = keyword
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
     let mut clauses = vec!["message_content LIKE ? ESCAPE '\\'".to_string()];
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(format!("%{}%", escaped_kw))];
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(format!("%{}%", escaped_kw))];
     if let Some(s) = since {
         clauses.push("create_time >= ?".into());
         params.push(Box::new(s));
@@ -1067,23 +1214,31 @@ fn search_in_table(
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_ref.as_slice(), |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
-            get_content_bytes(row, 4),
-            row.get::<_, i64>(5).unwrap_or(0),
-        ))
-    })?
-    .filter_map(|r| r.ok())
-    .collect::<Vec<_>>();
+    let rows = stmt
+        .query_map(params_ref.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                get_content_bytes(row, 4),
+                row.get::<_, i64>(5).unwrap_or(0),
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
 
     let mut result = Vec::new();
     for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
         let content = decompress_message(&content_bytes, ct);
-        let sender = sender_label(real_sender_id, &content, is_group, chat_username, &id2u, names_map);
+        let sender = sender_label(
+            real_sender_id,
+            &content,
+            is_group,
+            chat_username,
+            &id2u,
+            names_map,
+        );
         let text = fmt_content(local_id, local_type, &content, is_group);
 
         result.push(json!({
@@ -1101,13 +1256,15 @@ fn search_in_table(
 fn load_id2u(conn: &Connection) -> HashMap<i64, String> {
     let mut map = HashMap::new();
     if let Ok(mut stmt) = conn.prepare("SELECT rowid, user_name FROM Name2Id") {
-        let _ = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        }).map(|rows| {
-            for r in rows.flatten() {
-                map.insert(r.0, r.1);
-            }
-        });
+        let _ = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map(|rows| {
+                for r in rows.flatten() {
+                    map.insert(r.0, r.1);
+                }
+            });
     }
     map
 }
@@ -1233,10 +1390,10 @@ fn parse_revoke(xml: &str) -> Option<String> {
         return Some("[撤回了一条消息]".into());
     }
     // 尝试简化：如果是 XML 格式的撤回内容，直接显示摘要
-    Some(format!("[撤回] {}", inner
-        .chars()
-        .take(30)
-        .collect::<String>()))
+    Some(format!(
+        "[撤回] {}",
+        inner.chars().take(30).collect::<String>()
+    ))
 }
 
 /// 解析系统消息 XML（群通知等）
@@ -1272,7 +1429,11 @@ fn parse_appmsg(text: &str) -> Option<String> {
     let title = extract_xml_text(text, "title")?;
     let atype = extract_xml_text(text, "type").unwrap_or_default();
     match atype.as_str() {
-        "6" => Some(if !title.is_empty() { format!("[文件] {}", title) } else { "[文件]".into() }),
+        "6" => Some(if !title.is_empty() {
+            format!("[文件] {}", title)
+        } else {
+            "[文件]".into()
+        }),
         "57" => {
             let ref_content = extract_xml_text(text, "content")
                 .map(|s| {
@@ -1287,18 +1448,32 @@ fn parse_appmsg(text: &str) -> Option<String> {
                     let s: String = unescaped.split_whitespace().collect::<Vec<_>>().join(" ");
                     if s.chars().count() > 40 {
                         format!("{}...", s.chars().take(40).collect::<String>())
-                    } else { s }
+                    } else {
+                        s
+                    }
                 })
                 .unwrap_or_default();
-            let quote = if !title.is_empty() { format!("[引用] {}", title) } else { "[引用]".into() };
+            let quote = if !title.is_empty() {
+                format!("[引用] {}", title)
+            } else {
+                "[引用]".into()
+            };
             if !ref_content.is_empty() {
                 Some(format!("{}\n  \u{21b3} {}", quote, ref_content))
             } else {
                 Some(quote)
             }
         }
-        "33" | "36" | "44" => Some(if !title.is_empty() { format!("[小程序] {}", title) } else { "[小程序]".into() }),
-        _ => Some(if !title.is_empty() { format!("[链接] {}", title) } else { "[链接/文件]".into() }),
+        "33" | "36" | "44" => Some(if !title.is_empty() {
+            format!("[小程序] {}", title)
+        } else {
+            "[小程序]".into()
+        }),
+        _ => Some(if !title.is_empty() {
+            format!("[链接] {}", title)
+        } else {
+            "[链接/文件]".into()
+        }),
     }
 }
 
@@ -1310,18 +1485,34 @@ fn extract_xml_text(xml: &str, tag: &str) -> Option<String> {
     let end = xml[content_start..].find(&close)?;
     let raw = xml[content_start..content_start + end].trim();
     // 剥掉 CDATA 包装（公众号链接的 title/des 常见）
-    let stripped = raw.strip_prefix("<![CDATA[")
+    let stripped = raw
+        .strip_prefix("<![CDATA[")
         .and_then(|s| s.strip_suffix("]]>"))
         .unwrap_or(raw);
     Some(stripped.trim().to_string())
 }
 
+fn extract_xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
+    let open = format!("<{}", tag);
+    let start = xml.find(&open)?;
+    let tag_end = start + xml[start..].find('>')?;
+    let attr_pat = format!(r#"{}=""#, attr);
+    let attr_start = start + xml[start..tag_end].find(&attr_pat)? + attr_pat.len();
+    let attr_end = attr_start + xml[attr_start..tag_end].find('"')?;
+    let value = xml[attr_start..attr_end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 fn unescape_html(s: &str) -> String {
     s.replace("&lt;", "<")
-     .replace("&gt;", ">")
-     .replace("&amp;", "&")
-     .replace("&quot;", "\"")
-     .replace("&apos;", "'")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
 }
 
 fn xml_tag_re() -> &'static Regex {
@@ -1332,7 +1523,10 @@ fn xml_tag_re() -> &'static Regex {
 fn clean_inline_text(s: &str) -> String {
     let unescaped = unescape_html(s);
     let without_tags = xml_tag_re().replace_all(&unescaped, "");
-    without_tags.split_whitespace().collect::<Vec<_>>().join(" ")
+    without_tags
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -1345,7 +1539,8 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 }
 
 fn fmt_time(ts: i64, fmt: &str) -> String {
-    Local.timestamp_opt(ts, 0)
+    Local
+        .timestamp_opt(ts, 0)
         .single()
         .map(|dt| dt.format(fmt).to_string())
         .unwrap_or_else(|| ts.to_string())
@@ -1364,7 +1559,9 @@ pub async fn q_unread(
     limit: usize,
     filter: Option<Vec<String>>,
 ) -> Result<Value> {
-    let path = db.get("session/session.db").await?
+    let path = db
+        .get("session/session.db")
+        .await?
         .context("无法解密 session.db")?;
 
     // 归一化 filter：小写 + 去除别名。返回 None 代表"不过滤"。
@@ -1373,58 +1570,80 @@ pub async fn q_unread(
         for raw in v {
             match raw.trim().to_lowercase().as_str() {
                 "" | "all" => return None,
-                "private" => { set.insert("private"); }
-                "group" => { set.insert("group"); }
-                "official" | "official_account" => { set.insert("official_account"); }
-                "folded" | "fold" => { set.insert("folded"); }
+                "private" => {
+                    set.insert("private");
+                }
+                "group" => {
+                    set.insert("group");
+                }
+                "official" | "official_account" => {
+                    set.insert("official_account");
+                }
+                "folded" | "fold" => {
+                    set.insert("folded");
+                }
                 _ => {} // 未知值忽略，避免拼错导致什么都不返回
             }
         }
-        if set.is_empty() { None } else { Some(set) }
+        if set.is_empty() {
+            None
+        } else {
+            Some(set)
+        }
     });
 
     // 有 filter 时必须全表扫：SQL LIMIT 会把想要的公众号先筛掉。
     // 无 filter 时保留 LIMIT，避免重度用户的大量未读会话拖慢默认路径。
     let has_filter = filter_set.is_some();
     let limit_val = limit;
-    let rows: Vec<(String, i64, Vec<u8>, i64, i64, String, String)> = tokio::task::spawn_blocking(move || {
-        let conn = Connection::open(&path)?;
-        let sql = if has_filter {
-            "SELECT username, unread_count, summary, last_timestamp,
+    let rows: Vec<(String, i64, Vec<u8>, i64, i64, String, String)> =
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&path)?;
+            let sql = if has_filter {
+                "SELECT username, unread_count, summary, last_timestamp,
                     last_msg_type, last_msg_sender, last_sender_display_name
              FROM SessionTable WHERE unread_count > 0
              ORDER BY last_timestamp DESC"
-        } else {
-            "SELECT username, unread_count, summary, last_timestamp,
+            } else {
+                "SELECT username, unread_count, summary, last_timestamp,
                     last_msg_type, last_msg_sender, last_sender_display_name
              FROM SessionTable WHERE unread_count > 0
              ORDER BY last_timestamp DESC LIMIT ?"
-        };
-        let mut stmt = conn.prepare(sql)?;
-        let map_row = |row: &rusqlite::Row<'_>| Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1).unwrap_or(0),
-            get_content_bytes(row, 2),
-            row.get::<_, i64>(3).unwrap_or(0),
-            row.get::<_, i64>(4).unwrap_or(0),
-            row.get::<_, String>(5).unwrap_or_default(),
-            row.get::<_, String>(6).unwrap_or_default(),
-        ));
-        let rows = if has_filter {
-            stmt.query_map([], map_row)?.collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
-            stmt.query_map([limit_val as i64], map_row)?.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        Ok::<_, anyhow::Error>(rows)
-    }).await??;
+            };
+            let mut stmt = conn.prepare(sql)?;
+            let map_row = |row: &rusqlite::Row<'_>| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1).unwrap_or(0),
+                    get_content_bytes(row, 2),
+                    row.get::<_, i64>(3).unwrap_or(0),
+                    row.get::<_, i64>(4).unwrap_or(0),
+                    row.get::<_, String>(5).unwrap_or_default(),
+                    row.get::<_, String>(6).unwrap_or_default(),
+                ))
+            };
+            let rows = if has_filter {
+                stmt.query_map([], map_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                stmt.query_map([limit_val as i64], map_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            Ok::<_, anyhow::Error>(rows)
+        })
+        .await??;
 
     let mut results = Vec::new();
     for (username, unread, summary_bytes, ts, msg_type, sender, sender_name) in rows {
         let chat_type = chat_type_of(&username, names);
         if let Some(ref set) = filter_set {
-            if !set.contains(chat_type) { continue; }
+            if !set.contains(chat_type) {
+                continue;
+            }
         }
-        if results.len() >= limit { break; }
+        if results.len() >= limit {
+            break;
+        }
 
         let display = names.display(&username);
         let is_group = chat_type == "group";
@@ -1432,7 +1651,11 @@ pub async fn q_unread(
         let summary = strip_group_prefix(&summary);
         let sender_display = if is_group && !sender.is_empty() {
             names.map.get(&sender).cloned().unwrap_or_else(|| {
-                if !sender_name.is_empty() { sender_name.clone() } else { sender.clone() }
+                if !sender_name.is_empty() {
+                    sender_name.clone()
+                } else {
+                    sender.clone()
+                }
             })
         } else {
             String::new()
@@ -1457,8 +1680,8 @@ pub async fn q_unread(
 /// 查询群成员：优先从 contact.db 的 chatroom_member/chat_room 表获取完整列表，
 /// 若表不存在则退化为从消息记录聚合有发言记录的成员
 pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value> {
-    let username = resolve_username(chat, names)
-        .with_context(|| format!("找不到联系人: {}", chat))?;
+    let username =
+        resolve_username(chat, names).with_context(|| format!("找不到联系人: {}", chat))?;
 
     if !username.contains("@chatroom") {
         anyhow::bail!("'{}' 不是群聊，无法查看群成员", names.display(&username));
@@ -1476,11 +1699,13 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
         let members_opt: Option<Vec<Value>> = tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&contact_p)?;
 
-            let has_table: bool = conn.query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chatroom_member'",
-                [],
-                |_| Ok(true),
-            ).unwrap_or(false);
+            let has_table: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chatroom_member'",
+                    [],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
 
             if !has_table {
                 return Ok::<_, anyhow::Error>(None);
@@ -1492,11 +1717,18 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
                 "SELECT id, owner FROM chat_room WHERE username = ?",
                 "SELECT id, owner FROM chat_room WHERE chat_room_name = ?",
                 "SELECT id, owner FROM chat_room WHERE name = ?",
-            ].iter().find_map(|sql| {
+            ]
+            .iter()
+            .find_map(|sql| {
                 conn.query_row(sql, [&uname2], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1).unwrap_or_default()))
-                }).ok()
-            }).unwrap_or((0, String::new()));
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1).unwrap_or_default(),
+                    ))
+                })
+                .ok()
+            })
+            .unwrap_or((0, String::new()));
 
             if room_id == 0 {
                 return Ok::<_, anyhow::Error>(None);
@@ -1506,42 +1738,56 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
                 "SELECT c.username, c.nick_name, c.remark
                  FROM chatroom_member cm
                  LEFT JOIN contact c ON c.id = cm.member_id
-                 WHERE cm.room_id = ?"
+                 WHERE cm.room_id = ?",
             )?;
-            let raw: Vec<(String, String, String)> = stmt.query_map([room_id], |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, String>(1).unwrap_or_default(),
-                    row.get::<_, String>(2).unwrap_or_default(),
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .filter(|(uid, _, _)| !uid.is_empty())
-            .collect();
+            let raw: Vec<(String, String, String)> = stmt
+                .query_map([room_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0).unwrap_or_default(),
+                        row.get::<_, String>(1).unwrap_or_default(),
+                        row.get::<_, String>(2).unwrap_or_default(),
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .filter(|(uid, _, _)| !uid.is_empty())
+                .collect();
 
             if raw.is_empty() {
                 return Ok(None);
             }
 
-            let mut members: Vec<Value> = raw.iter().map(|(uid, nick, remark)| {
-                let disp = if !remark.is_empty() { remark.clone() }
-                    else if !nick.is_empty() { nick.clone() }
-                    else { names_map2.get(uid).cloned().unwrap_or_else(|| uid.clone()) };
-                let is_owner = uid == &owner && !owner.is_empty();
-                json!({ "username": uid, "display": disp, "is_owner": is_owner })
-            }).collect();
+            let mut members: Vec<Value> = raw
+                .iter()
+                .map(|(uid, nick, remark)| {
+                    let disp = if !remark.is_empty() {
+                        remark.clone()
+                    } else if !nick.is_empty() {
+                        nick.clone()
+                    } else {
+                        names_map2.get(uid).cloned().unwrap_or_else(|| uid.clone())
+                    };
+                    let is_owner = uid == &owner && !owner.is_empty();
+                    json!({ "username": uid, "display": disp, "is_owner": is_owner })
+                })
+                .collect();
 
             // 群主排首位，其余按 display 字典序
             members.sort_by(|a, b| {
                 let ao = a["is_owner"].as_bool().unwrap_or(false);
                 let bo = b["is_owner"].as_bool().unwrap_or(false);
-                if ao != bo { return bo.cmp(&ao); }
-                a["display"].as_str().unwrap_or("").cmp(b["display"].as_str().unwrap_or(""))
+                if ao != bo {
+                    return bo.cmp(&ao);
+                }
+                a["display"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["display"].as_str().unwrap_or(""))
             });
 
             let _ = display2; // 不在此 closure 内使用
             Ok(Some(members))
-        }).await??;
+        })
+        .await??;
 
         if let Some(members) = members_opt {
             return Ok(json!({
@@ -1574,31 +1820,41 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
             let conn = Connection::open(&path)?;
             let id2u = load_id2u(&conn);
             let mut stmt = conn.prepare(&format!(
-                "SELECT DISTINCT real_sender_id FROM [{}] WHERE real_sender_id > 0", tname
+                "SELECT DISTINCT real_sender_id FROM [{}] WHERE real_sender_id > 0",
+                tname
             ))?;
-            let ids: Vec<i64> = stmt.query_map([], |row| row.get(0))?
+            let ids: Vec<i64> = stmt
+                .query_map([], |row| row.get(0))?
                 .filter_map(|r| r.ok())
                 .collect();
-            let senders: Vec<String> = ids.iter()
+            let senders: Vec<String> = ids
+                .iter()
                 .filter_map(|id| id2u.get(id))
                 .filter(|u| *u != &uname)
                 .cloned()
                 .collect();
             Ok::<_, anyhow::Error>(senders)
-        }).await??;
+        })
+        .await??;
 
         sender_set.extend(senders);
     }
 
-    let mut members: Vec<Value> = sender_set.iter().map(|u| {
-        json!({
-            "username": u,
-            "display": names_map.get(u).cloned().unwrap_or_else(|| u.clone()),
-            "is_owner": false,
+    let mut members: Vec<Value> = sender_set
+        .iter()
+        .map(|u| {
+            json!({
+                "username": u,
+                "display": names_map.get(u).cloned().unwrap_or_else(|| u.clone()),
+                "is_owner": false,
+            })
         })
-    }).collect();
+        .collect();
     members.sort_by(|a, b| {
-        a["display"].as_str().unwrap_or("").cmp(b["display"].as_str().unwrap_or(""))
+        a["display"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["display"].as_str().unwrap_or(""))
     });
 
     Ok(json!({
@@ -1622,31 +1878,38 @@ pub async fn q_new_messages(
     let fallback_ts = chrono::Utc::now().timestamp() - 86400;
 
     // 1. 从 session.db 读取所有会话的当前 last_timestamp
-    let session_path = db.get("session/session.db").await?
+    let session_path = db
+        .get("session/session.db")
+        .await?
         .context("无法解密 session.db")?;
 
     let all_sessions: Vec<(String, i64)> = tokio::task::spawn_blocking(move || {
         let conn = Connection::open(&session_path)?;
         let mut stmt = conn.prepare(
-            "SELECT username, last_timestamp FROM SessionTable WHERE last_timestamp > 0"
+            "SELECT username, last_timestamp FROM SessionTable WHERE last_timestamp > 0",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1).unwrap_or(0)))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1).unwrap_or(0)))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok::<_, anyhow::Error>(rows)
-    }).await??;
+    })
+    .await??;
 
     // 2. 记录 session.db 的当前快照（用于构建 new_state 基础）
-    let session_ts_map: HashMap<String, i64> = all_sessions.iter()
+    let session_ts_map: HashMap<String, i64> = all_sessions
+        .iter()
         .map(|(u, ts)| (u.clone(), *ts))
         .collect();
 
     // 3. 找出有新消息的会话
     // 不在 state 中的会话（首次运行或新会话）以 fallback_ts 为基准
-    let changed: Vec<(String, i64)> = all_sessions.into_iter()
+    let changed: Vec<(String, i64)> = all_sessions
+        .into_iter()
         .filter(|(uname, ts)| {
-            let last_known = state.as_ref()
+            let last_known = state
+                .as_ref()
                 .and_then(|m| m.get(uname))
                 .copied()
                 .unwrap_or(fallback_ts);
@@ -1668,12 +1931,15 @@ pub async fn q_new_messages(
     let mut all_msgs: Vec<Value> = Vec::new();
 
     for (uname, _) in &changed {
-        let since_ts = state.as_ref()
+        let since_ts = state
+            .as_ref()
             .and_then(|m| m.get(uname))
             .copied()
             .unwrap_or(fallback_ts);
         let tables = find_msg_tables(db, names, uname).await?;
-        if tables.is_empty() { continue; }
+        if tables.is_empty() {
+            continue;
+        }
 
         let display = names.display(uname);
         let chat_type = chat_type_of(uname, names);
@@ -1697,26 +1963,34 @@ pub async fn q_new_messages(
                      FROM [{}] WHERE create_time > ? ORDER BY create_time ASC LIMIT ?",
                     tname
                 );
-                let rows: Vec<_> = conn.prepare(&sql)
+                let rows: Vec<_> = conn
+                    .prepare(&sql)
                     .and_then(|mut stmt| {
-                        stmt.query_map(
-                            rusqlite::params![since_ts, per_table_limit as i64],
-                            |row| Ok((
+                        stmt.query_map(rusqlite::params![since_ts, per_table_limit as i64], |row| {
+                            Ok((
                                 row.get::<_, i64>(0)?,
                                 row.get::<_, i64>(1)?,
                                 row.get::<_, i64>(2)?,
                                 row.get::<_, i64>(3)?,
                                 get_content_bytes(row, 4),
                                 row.get::<_, i64>(5).unwrap_or(0),
-                            )),
-                        ).map(|it| it.filter_map(|r| r.ok()).collect())
+                            ))
+                        })
+                        .map(|it| it.filter_map(|r| r.ok()).collect())
                     })
                     .unwrap_or_default();
 
                 let mut result = Vec::new();
                 for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
                     let content = decompress_message(&content_bytes, ct);
-                    let sender = sender_label(real_sender_id, &content, is_group, &uname2, &id2u, &names_map);
+                    let sender = sender_label(
+                        real_sender_id,
+                        &content,
+                        is_group,
+                        &uname2,
+                        &id2u,
+                        &names_map,
+                    );
                     let text = fmt_content(local_id, local_type, &content, is_group);
                     result.push(json!({
                         "chat": display2,
@@ -1731,10 +2005,18 @@ pub async fn q_new_messages(
                     }));
                 }
                 Ok::<_, anyhow::Error>(result)
-            }).await {
+            })
+            .await
+            {
                 Ok(Ok(v)) => v,
-                Ok(Err(e)) => { eprintln!("[new-messages] skip {}: {}", tname_for_log, e); continue; }
-                Err(e) => { eprintln!("[new-messages] task error: {}", e); continue; }
+                Ok(Err(e)) => {
+                    eprintln!("[new-messages] skip {}: {}", tname_for_log, e);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[new-messages] task error: {}", e);
+                    continue;
+                }
             };
 
             all_msgs.extend(msgs);
@@ -1751,7 +2033,8 @@ pub async fn q_new_messages(
     let mut new_state = session_ts_map;
     // 先把 changed 会话重置回旧 since_ts
     for (uname, _) in &changed {
-        let old_ts = state.as_ref()
+        let old_ts = state
+            .as_ref()
             .and_then(|m| m.get(uname))
             .copied()
             .unwrap_or(fallback_ts);
@@ -1761,7 +2044,9 @@ pub async fn q_new_messages(
     for m in &all_msgs {
         if let (Some(uname), Some(ts)) = (m["username"].as_str(), m["timestamp"].as_i64()) {
             let e = new_state.entry(uname.to_string()).or_insert(0);
-            if ts > *e { *e = ts; }
+            if ts > *e {
+                *e = ts;
+            }
         }
     }
 
@@ -1779,7 +2064,9 @@ pub async fn q_favorites(
     fav_type: Option<i64>,
     query: Option<String>,
 ) -> Result<Value> {
-    let path = db.get("favorite/favorite.db").await?
+    let path = db
+        .get("favorite/favorite.db")
+        .await?
         .context("找不到 favorite.db，请确认微信数据目录")?;
 
     let rows: Vec<Value> = tokio::task::spawn_blocking(move || {
@@ -1793,7 +2080,10 @@ pub async fn q_favorites(
             params.push(Box::new(t));
         }
         let like_str: Option<String> = query.map(|q| {
-            let esc = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            let esc = q
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
             format!("%{}%", esc)
         });
         if let Some(ref s) = like_str {
@@ -1814,52 +2104,55 @@ pub async fn q_favorites(
             where_clause
         );
 
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
-        let rows: Vec<Value> = stmt.query_map(params_ref.as_slice(), |row| {
-            Ok((
-                row.get::<_, i64>(0).unwrap_or(0),
-                row.get::<_, i64>(1).unwrap_or(0),
-                row.get::<_, i64>(2).unwrap_or(0),
-                row.get::<_, String>(3).unwrap_or_default(),
-                row.get::<_, String>(4).unwrap_or_default(),
-                row.get::<_, String>(5).unwrap_or_default(),
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .map(|(local_id, ftype, ts, content, fromusr, chatname)| {
-            let type_str = match ftype {
-                1 => "文本",
-                2 => "图片",
-                5 => "文章",
-                19 => "名片",
-                20 => "视频",
-                _ => "其他",
-            };
-            // 安全截断（按 Unicode 字符而非字节）
-            let preview: String = content.chars().take(100).collect();
-            let preview = if content.chars().count() > 100 {
-                format!("{}...", preview)
-            } else {
-                preview
-            };
-            // WeChat 部分版本的 update_time 为毫秒，10位以上判定为毫秒后转秒
-            let ts_secs = if ts > 9_999_999_999 { ts / 1000 } else { ts };
-            json!({
-                "id": local_id,
-                "type": type_str,
-                "type_num": ftype,
-                "time": fmt_time(ts_secs, "%Y-%m-%d %H:%M"),
-                "timestamp": ts_secs,
-                "preview": preview,
-                "from": fromusr,
-                "chat": chatname,
+        let rows: Vec<Value> = stmt
+            .query_map(params_ref.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>(0).unwrap_or(0),
+                    row.get::<_, i64>(1).unwrap_or(0),
+                    row.get::<_, i64>(2).unwrap_or(0),
+                    row.get::<_, String>(3).unwrap_or_default(),
+                    row.get::<_, String>(4).unwrap_or_default(),
+                    row.get::<_, String>(5).unwrap_or_default(),
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(local_id, ftype, ts, content, fromusr, chatname)| {
+                let type_str = match ftype {
+                    1 => "文本",
+                    2 => "图片",
+                    5 => "文章",
+                    19 => "名片",
+                    20 => "视频",
+                    _ => "其他",
+                };
+                // 安全截断（按 Unicode 字符而非字节）
+                let preview: String = content.chars().take(100).collect();
+                let preview = if content.chars().count() > 100 {
+                    format!("{}...", preview)
+                } else {
+                    preview
+                };
+                // WeChat 部分版本的 update_time 为毫秒，10位以上判定为毫秒后转秒
+                let ts_secs = if ts > 9_999_999_999 { ts / 1000 } else { ts };
+                json!({
+                    "id": local_id,
+                    "type": type_str,
+                    "type_num": ftype,
+                    "time": fmt_time(ts_secs, "%Y-%m-%d %H:%M"),
+                    "timestamp": ts_secs,
+                    "preview": preview,
+                    "from": fromusr,
+                    "chat": chatname,
+                })
             })
-        })
-        .collect();
+            .collect();
 
         Ok::<_, anyhow::Error>(rows)
-    }).await??;
+    })
+    .await??;
 
     Ok(json!({
         "count": rows.len(),
@@ -1875,8 +2168,8 @@ pub async fn q_stats(
     since: Option<i64>,
     until: Option<i64>,
 ) -> Result<Value> {
-    let username = resolve_username(chat, names)
-        .with_context(|| format!("找不到联系人: {}", chat))?;
+    let username =
+        resolve_username(chat, names).with_context(|| format!("找不到联系人: {}", chat))?;
     let display = names.display(&username);
     let chat_type = chat_type_of(&username, names);
     let is_group = chat_type == "group";
@@ -1998,26 +2291,36 @@ pub async fn q_stats(
 
         let (count, type_c, sender_c, hour_c) = result;
         total += count;
-        for (k, v) in type_c { *type_counts.entry(k).or_insert(0) += v; }
-        for (k, v) in sender_c { *sender_counts.entry(k).or_insert(0) += v; }
-        for i in 0..24 { hour_counts[i] += hour_c[i]; }
+        for (k, v) in type_c {
+            *type_counts.entry(k).or_insert(0) += v;
+        }
+        for (k, v) in sender_c {
+            *sender_counts.entry(k).or_insert(0) += v;
+        }
+        for i in 0..24 {
+            hour_counts[i] += hour_c[i];
+        }
     }
 
     // 类型分布，按数量降序
-    let mut by_type: Vec<Value> = type_counts.iter()
+    let mut by_type: Vec<Value> = type_counts
+        .iter()
         .map(|(t, c)| json!({ "type": t, "count": c }))
         .collect();
     by_type.sort_by_key(|v| std::cmp::Reverse(v["count"].as_i64().unwrap_or(0)));
 
     // 发言排行，Top 10
-    let mut top_senders: Vec<Value> = sender_counts.iter()
+    let mut top_senders: Vec<Value> = sender_counts
+        .iter()
         .map(|(s, c)| json!({ "sender": s, "count": c }))
         .collect();
     top_senders.sort_by_key(|v| std::cmp::Reverse(v["count"].as_i64().unwrap_or(0)));
     top_senders.truncate(10);
 
     // 24小时分布
-    let by_hour: Vec<Value> = hour_counts.iter().enumerate()
+    let by_hour: Vec<Value> = hour_counts
+        .iter()
+        .enumerate()
         .map(|(h, c)| json!({ "hour": h, "count": c }))
         .collect();
 
@@ -2033,11 +2336,10 @@ pub async fn q_stats(
     }))
 }
 
-
 // ─── 朋友圈（Moments / SNS） ───────────────────────────────────────────────────
 
-/// 查询朋友圈时间线。数据来自 `sns/sns.db` 的 `SnsTimeLine` 表，
-/// `content` 字段是 `<SnsDataItem><TimelineObject>...</TimelineObject></SnsDataItem>` XML。
+/// 兼容旧 `wx moments` 命令：底层复用新的 sns-feed / sns-search 解析结果，
+/// 再映射回历史输出字段，保证 dossier app 和旧脚本都还能直接消费。
 pub async fn q_moments(
     db: &DbCache,
     names: &Names,
@@ -2048,182 +2350,13 @@ pub async fn q_moments(
     query: Option<String>,
     with_media: bool,
 ) -> Result<Value> {
-    let path = db.get("sns/sns.db").await?
-        .context("无法解密 sns.db（朋友圈数据库）")?;
-
-    // 先按 user 参数解析出 target username（如指定）
-    let target_uname: Option<String> = user.as_deref()
-        .and_then(|u| resolve_username(u, names));
-
-    let user_arg = user.clone();
-    let target_clone = target_uname.clone();
-    let query_clone = query.clone();
-
-    let rows: Vec<(i64, String, String)> = tokio::task::spawn_blocking(move || {
-        let conn = Connection::open(&path)?;
-        let mut clauses: Vec<&'static str> = Vec::new();
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(u) = target_clone.as_ref() {
-            clauses.push("user_name = ?");
-            params.push(Box::new(u.clone()));
+    let sns_payload = match query.filter(|keyword| !keyword.trim().is_empty()) {
+        Some(keyword) => {
+            q_sns_search(db, names, &keyword, limit, since, until, user.as_deref()).await?
         }
-
-        let where_clause = if clauses.is_empty() { String::new() }
-            else { format!("WHERE {}", clauses.join(" AND ")) };
-        // 比 limit 多取几倍，因为还要按 since/until/query 二次过滤
-        // SnsTimeLine 的 tid 是 DESC 主键，近似按时间倒序（但 createTime 在 XML 里才精确）
-        let fetch_cap = std::cmp::max(limit * 5, 200);
-        params.push(Box::new(fetch_cap as i64));
-
-        let sql = format!(
-            "SELECT tid, user_name, content FROM SnsTimeLine {} ORDER BY tid DESC LIMIT ?",
-            where_clause
-        );
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows: Vec<(i64, String, String)> = stmt.query_map(params_ref.as_slice(), |row| {
-            Ok((
-                row.get::<_, i64>(0).unwrap_or(0),
-                row.get::<_, String>(1).unwrap_or_default(),
-                row.get::<_, String>(2).unwrap_or_default(),
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-        Ok::<_, anyhow::Error>(rows)
-    }).await??;
-
-    // 如果用户指定了 user 但没解析到 target，给个友好错误
-    if user_arg.is_some() && target_uname.is_none() {
-        anyhow::bail!("找不到联系人: {}", user_arg.unwrap());
-    }
-
-    let like = query_clone.as_ref().map(|q| q.to_lowercase());
-    let mut out: Vec<Value> = Vec::new();
-    for (_tid, uname, content) in rows {
-        let parsed = match parse_moment(&content) {
-            Some(m) => m,
-            None => continue,
-        };
-
-        // 时间过滤
-        if let Some(s) = since {
-            if parsed.create_time < s { continue; }
-        }
-        if let Some(u) = until {
-            if parsed.create_time > u { continue; }
-        }
-        // 关键词过滤
-        if let Some(ref kw) = like {
-            if !parsed.text.to_lowercase().contains(kw) { continue; }
-        }
-
-        let author_uname = if !parsed.username.is_empty() { &parsed.username } else { &uname };
-        let mut obj = serde_json::Map::new();
-        obj.insert("id".into(), json!(parsed.id));
-        obj.insert("author".into(), json!(names.display(author_uname)));
-        obj.insert("username".into(), json!(author_uname.clone()));
-        obj.insert("time".into(), json!(fmt_time(parsed.create_time, "%Y-%m-%d %H:%M")));
-        obj.insert("timestamp".into(), json!(parsed.create_time));
-        obj.insert("type".into(), json!(parsed.kind));
-        obj.insert("text".into(), json!(parsed.text));
-        if !parsed.link.is_empty() {
-            obj.insert("link".into(), json!(parsed.link));
-        }
-        if with_media && !parsed.media.is_empty() {
-            obj.insert("media".into(), json!(parsed.media));
-        } else if !parsed.media.is_empty() {
-            obj.insert("media_count".into(), json!(parsed.media.len()));
-        }
-        out.push(Value::Object(obj));
-
-        if out.len() >= limit { break; }
-    }
-
-    // 精确按 createTime 倒序（tid 不完全等于 time）
-    out.sort_by_key(|m| std::cmp::Reverse(m["timestamp"].as_i64().unwrap_or(0)));
-    Ok(json!({ "count": out.len(), "moments": out }))
-}
-
-struct ParsedMoment {
-    id: String,
-    username: String,
-    create_time: i64,
-    text: String,
-    kind: String,        // text / photos / video / link / share / unknown
-    link: String,        // ContentObject.contentUrl（分享/链接类才有）
-    media: Vec<String>,  // 缩略图或视频 URL
-}
-
-fn parse_moment(xml: &str) -> Option<ParsedMoment> {
-    let id = extract_xml_text(xml, "id").unwrap_or_default();
-    let username = extract_xml_text(xml, "username").unwrap_or_default();
-    let create_time: i64 = extract_xml_text(xml, "createTime")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let text = extract_xml_text(xml, "contentDesc").unwrap_or_default();
-
-    // ContentObject 里才有真正的 type
-    let content_obj = extract_tag_block(xml, "ContentObject").unwrap_or_default();
-    let type_num: i64 = extract_xml_text(&content_obj, "type")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    // WeChat 给所有 moments 的 ContentObject 都塞了一个升级占位 URL（page/common_page__upgrade），
-    // 那不是真实分享链接，过滤掉
-    let link_raw = extract_xml_text(&content_obj, "contentUrl").unwrap_or_default();
-    let link = if link_raw.contains("common_page__upgrade") { String::new() } else { link_raw };
-
-    // 抓图片/视频缩略图 URL。media 标签里 thumb 可能是纯文本 URL 也可能带 key/enc_idx 属性
-    let mut media: Vec<String> = Vec::new();
-    let media_block = extract_tag_block(&content_obj, "mediaList").unwrap_or_default();
-    let mut rest = media_block.as_str();
-    while let Some(start) = rest.find("<thumb") {
-        let after = &rest[start..];
-        // 找到 thumb 标签结束位置
-        let tag_close = after.find('>')?;
-        let after_open = &after[tag_close + 1..];
-        // 再找 </thumb>
-        if let Some(end) = after_open.find("</thumb>") {
-            let url = after_open[..end].trim();
-            if !url.is_empty() {
-                media.push(unescape_html(url));
-            }
-            rest = &after_open[end + "</thumb>".len()..];
-        } else {
-            break;
-        }
-    }
-
-    if id.is_empty() && create_time == 0 && text.is_empty() && media.is_empty() {
-        return None;
-    }
-    // 类型判断：先按 type_num，再根据实际内容兜底，避免被空 ContentObject 误判
-    let kind = moment_type_str(type_num, !media.is_empty(), !link.is_empty()).to_string();
-    Some(ParsedMoment { id, username, create_time, text, kind, link, media })
-}
-
-/// 提取 `<tag>...</tag>` 的内部块（保留子标签，不做 CDATA 剥离）
-fn extract_tag_block(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-    let start = xml.find(&open)?;
-    let content_start = start + open.len();
-    let end = xml[content_start..].find(&close)?;
-    Some(xml[content_start..content_start + end].to_string())
-}
-
-/// ContentObject.type 映射（观察到的常见值，未知返回 "unknown"）
-///   1=分享链接 / 2=图片 / 3=文字 / 4=音乐 / 5=视频分享 / 15=小视频 / 其他...
-/// 同时用 has_media / has_link 兜底：type 不可靠时按实际内容判断
-fn moment_type_str(t: i64, has_media: bool, has_link: bool) -> &'static str {
-    match t {
-        15 => "video",
-        4 | 5 => "music",
-        _ if has_link => "link",
-        _ if has_media => "photos",
-        _ => "text",
-    }
+        None => q_sns_feed(db, names, limit, since, until, user.as_deref()).await?,
+    };
+    Ok(legacy_moments_from_posts(&sns_payload, with_media))
 }
 
 /// 查询朋友圈收件箱（别人对我的评论/点赞通知）。
@@ -2237,75 +2370,678 @@ pub async fn q_moments_inbox(
     until: Option<i64>,
     unread_only: bool,
 ) -> Result<Value> {
-    let path = db.get("sns/sns.db").await?
-        .context("无法解密 sns.db")?;
+    let path = db.get("sns/sns.db").await?.context("无法解密 sns.db")?;
 
-    let rows: Vec<(i64, i64, String, String, String, String, String, i64, i64)>
-        = tokio::task::spawn_blocking(move || {
-        let conn = Connection::open(&path)?;
-        let mut clauses: Vec<&'static str> = Vec::new();
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(s) = since { clauses.push("create_time >= ?"); params.push(Box::new(s)); }
-        if let Some(u) = until { clauses.push("create_time <= ?"); params.push(Box::new(u)); }
-        if unread_only { clauses.push("is_unread = 1"); }
-        let where_clause = if clauses.is_empty() { String::new() }
-            else { format!("WHERE {}", clauses.join(" AND ")) };
-        params.push(Box::new(limit as i64));
+    let rows: Vec<(i64, i64, String, String, String, String, String, i64, i64)> =
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&path)?;
+            let mut clauses: Vec<&'static str> = Vec::new();
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            if let Some(s) = since {
+                clauses.push("create_time >= ?");
+                params.push(Box::new(s));
+            }
+            if let Some(u) = until {
+                clauses.push("create_time <= ?");
+                params.push(Box::new(u));
+            }
+            if unread_only {
+                clauses.push("is_unread = 1");
+            }
+            let where_clause = if clauses.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", clauses.join(" AND "))
+            };
+            params.push(Box::new(limit as i64));
 
-        let sql = format!(
-            "SELECT create_time, type, from_username, from_nickname, \
+            let sql = format!(
+                "SELECT create_time, type, from_username, from_nickname, \
                     to_username, to_nickname, content, feed_id, is_unread \
+             FROM SnsMessage_tmp3 {} ORDER BY create_time DESC LIMIT ?",
+                where_clause
+            );
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows: Vec<_> = stmt
+                .query_map(params_ref.as_slice(), |r| {
+                    Ok((
+                        r.get::<_, i64>(0).unwrap_or(0),
+                        r.get::<_, i64>(1).unwrap_or(0),
+                        r.get::<_, String>(2).unwrap_or_default(),
+                        r.get::<_, String>(3).unwrap_or_default(),
+                        r.get::<_, String>(4).unwrap_or_default(),
+                        r.get::<_, String>(5).unwrap_or_default(),
+                        r.get::<_, String>(6).unwrap_or_default(),
+                        r.get::<_, i64>(7).unwrap_or(0),
+                        r.get::<_, i64>(8).unwrap_or(0),
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok::<_, anyhow::Error>(rows)
+        })
+        .await??;
+
+    let out: Vec<Value> = rows
+        .into_iter()
+        .map(
+            |(ts, typ, from_u, from_n, to_u, to_n, content, feed_id, unread)| {
+                let action = match typ {
+                    1 => "like",
+                    2 => "comment",
+                    _ => "other",
+                };
+                let from_disp = if !from_u.is_empty() && names.map.contains_key(&from_u) {
+                    names.display(&from_u)
+                } else {
+                    from_n.clone()
+                };
+                let to_disp = if !to_u.is_empty() && names.map.contains_key(&to_u) {
+                    names.display(&to_u)
+                } else {
+                    to_n.clone()
+                };
+
+                let mut obj = serde_json::Map::new();
+                obj.insert("time".into(), json!(fmt_time(ts, "%Y-%m-%d %H:%M")));
+                obj.insert("timestamp".into(), json!(ts));
+                obj.insert("action".into(), json!(action));
+                obj.insert("from".into(), json!(from_disp));
+                obj.insert("from_username".into(), json!(from_u));
+                obj.insert("to".into(), json!(to_disp));
+                obj.insert("feed_id".into(), json!(feed_id.to_string()));
+                if !content.is_empty() {
+                    obj.insert("content".into(), json!(content));
+                }
+                if unread != 0 {
+                    obj.insert("unread".into(), json!(true));
+                }
+                Value::Object(obj)
+            },
+        )
+        .collect();
+
+    Ok(json!({ "count": out.len(), "inbox": out }))
+}
+
+/// 查询朋友圈互动通知（点赞 + 评论），对应微信 app 右上角的红点入口。
+/// 空 `content` 是点赞，非空是评论正文。
+pub async fn q_sns_notifications(
+    db: &DbCache,
+    names: &Names,
+    limit: usize,
+    since: Option<i64>,
+    until: Option<i64>,
+    include_read: bool,
+) -> Result<Value> {
+    let path = db.get("sns/sns.db").await?.context("无法解密 sns.db")?;
+
+    let path2 = path.clone();
+    type Row = (i64, i64, i64, i64, String, String, String);
+    let rows: Vec<Row> = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(&path2)?;
+        let mut clauses: Vec<&str> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if !include_read {
+            clauses.push("is_unread = 1");
+        }
+        if let Some(s) = since {
+            clauses.push("create_time >= ?");
+            params.push(Box::new(s));
+        }
+        if let Some(u) = until {
+            clauses.push("create_time <= ?");
+            params.push(Box::new(u));
+        }
+        let where_clause = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT local_id, create_time, type, feed_id, from_username, from_nickname, content
              FROM SnsMessage_tmp3 {} ORDER BY create_time DESC LIMIT ?",
             where_clause
         );
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        params.push(Box::new(limit as i64));
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
-        let rows: Vec<_> = stmt.query_map(params_ref.as_slice(), |r| Ok((
-            r.get::<_, i64>(0).unwrap_or(0),
-            r.get::<_, i64>(1).unwrap_or(0),
-            r.get::<_, String>(2).unwrap_or_default(),
-            r.get::<_, String>(3).unwrap_or_default(),
-            r.get::<_, String>(4).unwrap_or_default(),
-            r.get::<_, String>(5).unwrap_or_default(),
-            r.get::<_, String>(6).unwrap_or_default(),
-            r.get::<_, i64>(7).unwrap_or(0),
-            r.get::<_, i64>(8).unwrap_or(0),
-        )))?.filter_map(|r| r.ok()).collect();
+        let rows = stmt
+            .query_map(params_ref.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2).unwrap_or(0),
+                    row.get::<_, i64>(3).unwrap_or(0),
+                    row.get::<_, String>(4).unwrap_or_default(),
+                    row.get::<_, String>(5).unwrap_or_default(),
+                    row.get::<_, String>(6).unwrap_or_default(),
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok::<_, anyhow::Error>(rows)
+    })
+    .await??;
+
+    let feed_ids: Vec<i64> = {
+        let mut v: Vec<i64> = rows.iter().map(|r| r.3).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let path3 = path.clone();
+    let feed_ids_clone = feed_ids.clone();
+    let feeds: HashMap<i64, (String, String)> = tokio::task::spawn_blocking(move || {
+        if feed_ids_clone.is_empty() {
+            return Ok::<_, anyhow::Error>(HashMap::new());
+        }
+        let conn = Connection::open(&path3)?;
+        let placeholders = std::iter::repeat("?")
+            .take(feed_ids_clone.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT tid, user_name, content FROM SnsTimeLine WHERE tid IN ({})",
+            placeholders
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = feed_ids_clone
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut map = HashMap::new();
+        let mut rows2 = stmt.query(params.as_slice())?;
+        while let Some(row) = rows2.next()? {
+            let tid: i64 = row.get(0)?;
+            let author: String = row.get::<_, String>(1).unwrap_or_default();
+            let content: String = row.get::<_, String>(2).unwrap_or_default();
+            let preview = extract_xml_text(&content, "contentDesc")
+                .map(|s| s.chars().take(60).collect::<String>())
+                .unwrap_or_default();
+            let author = if author.is_empty() {
+                extract_xml_text(&content, "username").unwrap_or_default()
+            } else {
+                author
+            };
+            map.insert(tid, (author, preview));
+        }
+        Ok(map)
+    })
+    .await??;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (_local_id, ct, _typ, fid, from_u, from_nick, content) in rows {
+        let kind = if content.trim().is_empty() {
+            "like"
+        } else {
+            "comment"
+        };
+        let display = if !from_nick.is_empty() {
+            from_nick.clone()
+        } else {
+            names.display(&from_u)
+        };
+        let (feed_author_u, feed_preview) = feeds.get(&fid).cloned().unwrap_or_default();
+        let feed_author_display = if feed_author_u.is_empty() {
+            String::new()
+        } else {
+            names.display(&feed_author_u)
+        };
+        out.push(json!({
+            "type": kind,
+            "time": fmt_time(ct, "%m-%d %H:%M"),
+            "timestamp": ct,
+            "from_username": from_u,
+            "from_nickname": display,
+            "content": content,
+            "feed_id": fid,
+            "feed_author_username": feed_author_u,
+            "feed_author": feed_author_display,
+            "feed_preview": feed_preview,
+        }));
+    }
+    let total = out.len();
+    Ok(json!({ "notifications": out, "total": total }))
+}
+
+const SNS_MAX_LIMIT: usize = 10_000;
+const SNS_MAX_SCAN: usize = 50_000;
+
+fn legacy_moments_from_posts(payload: &Value, with_media: bool) -> Value {
+    let Some(posts) = payload.get("posts").and_then(Value::as_array) else {
+        return json!({ "count": 0, "moments": [] });
+    };
+
+    let moments: Vec<Value> = posts
+        .iter()
+        .map(|post| {
+            let media = post
+                .get("media")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let has_video = media.iter().any(|item| {
+                item.get("video_duration").and_then(Value::as_i64).is_some()
+                    || item.get("type").and_then(Value::as_str) == Some("15")
+            });
+            let kind = if has_video {
+                "video"
+            } else if !media.is_empty() {
+                "photos"
+            } else {
+                "text"
+            };
+
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "id".into(),
+                Value::String(
+                    post.get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            post.get("tid")
+                                .and_then(Value::as_i64)
+                                .map(|value| value.to_string())
+                        })
+                        .unwrap_or_default(),
+                ),
+            );
+            obj.insert(
+                "author".into(),
+                Value::String(
+                    post.get("author")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+            );
+            obj.insert(
+                "username".into(),
+                Value::String(
+                    post.get("username")
+                        .and_then(Value::as_str)
+                        .or_else(|| post.get("author_username").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+            );
+            obj.insert(
+                "text".into(),
+                Value::String(
+                    post.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| post.get("content").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+            );
+            obj.insert(
+                "time".into(),
+                Value::String(
+                    post.get("time")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+            );
+            obj.insert(
+                "timestamp".into(),
+                Value::from(post.get("timestamp").and_then(Value::as_i64).unwrap_or(0)),
+            );
+            obj.insert("type".into(), Value::String(kind.to_string()));
+            if with_media && !media.is_empty() {
+                obj.insert("media".into(), Value::Array(media));
+            } else if !media.is_empty() {
+                obj.insert("media_count".into(), Value::from(media.len() as i64));
+            } else if let Some(count) = post.get("media_count").and_then(Value::as_i64) {
+                obj.insert("media_count".into(), Value::from(count));
+            }
+            if let Some(location) = post.get("location").and_then(Value::as_str) {
+                if !location.is_empty() {
+                    obj.insert("location".into(), Value::String(location.to_string()));
+                }
+            }
+            if let Some(link) = post.get("link").and_then(Value::as_str) {
+                if !link.is_empty() {
+                    obj.insert("link".into(), Value::String(link.to_string()));
+                }
+            }
+            Value::Object(obj)
+        })
+        .collect();
+
+    json!({ "count": moments.len(), "moments": moments })
+}
+
+fn escape_like_pattern(s: &str) -> String {
+    s.replace('\\', r"\\")
+        .replace('%', r"\%")
+        .replace('_', r"\_")
+}
+
+fn xml_child<'a, 'input>(node: Node<'a, 'input>, tag: &str) -> Option<Node<'a, 'input>> {
+    node.children()
+        .find(|child| child.is_element() && child.has_tag_name(tag))
+}
+
+fn xml_text<'a, 'input>(node: Option<Node<'a, 'input>>) -> Option<String> {
+    node.and_then(|n| n.text())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn xml_attr<'a, 'input>(node: Option<Node<'a, 'input>>, attr: &str) -> Option<String> {
+    node.and_then(|n| n.attribute(attr))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn insert_media_string(out: &mut serde_json::Map<String, Value>, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        out.insert(key.to_string(), Value::String(value));
+    }
+}
+
+fn insert_media_i64(out: &mut serde_json::Map<String, Value>, key: &str, value: Option<i64>) {
+    if let Some(value) = value {
+        out.insert(key.to_string(), Value::from(value));
+    }
+}
+
+fn parse_media_from_timeline(timeline: Node) -> Vec<Value> {
+    let Some(media_list) =
+        xml_child(timeline, "ContentObject").and_then(|node| xml_child(node, "mediaList"))
+    else {
+        return Vec::new();
+    };
+
+    media_list
+        .children()
+        .filter(|node| node.is_element() && node.has_tag_name("media"))
+        .map(|media| {
+            let url_el = xml_child(media, "url");
+            let thumb_el = xml_child(media, "thumb");
+            let size_el = xml_child(media, "size");
+            let mut out = serde_json::Map::new();
+
+            insert_media_string(&mut out, "type", xml_text(xml_child(media, "type")));
+            insert_media_string(&mut out, "sub_type", xml_text(xml_child(media, "sub_type")));
+            insert_media_string(&mut out, "url", xml_text(url_el));
+            insert_media_string(&mut out, "thumb", xml_text(thumb_el));
+            insert_media_string(&mut out, "md5", xml_attr(url_el, "md5"));
+            insert_media_string(&mut out, "url_key", xml_attr(url_el, "key"));
+            insert_media_string(&mut out, "url_token", xml_attr(url_el, "token"));
+            insert_media_string(&mut out, "url_enc_idx", xml_attr(url_el, "enc_idx"));
+            insert_media_string(&mut out, "thumb_key", xml_attr(thumb_el, "key"));
+            insert_media_string(&mut out, "thumb_token", xml_attr(thumb_el, "token"));
+            insert_media_string(&mut out, "thumb_enc_idx", xml_attr(thumb_el, "enc_idx"));
+            insert_media_i64(
+                &mut out,
+                "width",
+                xml_attr(size_el, "width").and_then(|v| v.parse::<i64>().ok()),
+            );
+            insert_media_i64(
+                &mut out,
+                "height",
+                xml_attr(size_el, "height").and_then(|v| v.parse::<i64>().ok()),
+            );
+            insert_media_i64(
+                &mut out,
+                "total_size",
+                xml_attr(size_el, "totalSize").and_then(|v| v.parse::<i64>().ok()),
+            );
+            insert_media_string(
+                &mut out,
+                "video_md5",
+                xml_text(xml_child(media, "videomd5")),
+            );
+            insert_media_i64(
+                &mut out,
+                "video_duration",
+                xml_text(xml_child(media, "videoDuration")).and_then(|v| v.parse::<i64>().ok()),
+            );
+
+            Value::Object(out)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn parse_post_media(xml: &str) -> Vec<Value> {
+    let Ok(doc) = Document::parse(xml) else {
+        return Vec::new();
+    };
+    let Some(timeline) = doc.descendants().find(|n| n.has_tag_name("TimelineObject")) else {
+        return Vec::new();
+    };
+    parse_media_from_timeline(timeline)
+}
+
+struct ParsedPost {
+    tid: i64,
+    create_time: i64,
+    author_username: String,
+    content: String,
+    media: Vec<Value>,
+    location: String,
+}
+
+fn parse_post_xml_fallback(tid: i64, user_name_column: &str, content: &str) -> ParsedPost {
+    let create_time = extract_xml_text(content, "createTime")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let text = extract_xml_text(content, "contentDesc")
+        .map(|s| unescape_html(&s))
+        .unwrap_or_default();
+    let author_username = if user_name_column.is_empty() {
+        extract_xml_text(content, "username")
+            .map(|s| unescape_html(&s))
+            .unwrap_or_default()
+    } else {
+        user_name_column.to_string()
+    };
+    let location = extract_xml_attr(content, "location", "poiName")
+        .map(|s| unescape_html(&s))
+        .unwrap_or_default();
+
+    ParsedPost {
+        tid,
+        create_time,
+        author_username,
+        content: text,
+        media: Vec::new(),
+        location,
+    }
+}
+
+fn parse_post_xml(tid: i64, user_name_column: &str, content: &str) -> ParsedPost {
+    let Ok(doc) = Document::parse(content) else {
+        return parse_post_xml_fallback(tid, user_name_column, content);
+    };
+    let Some(timeline) = doc.descendants().find(|n| n.has_tag_name("TimelineObject")) else {
+        return parse_post_xml_fallback(tid, user_name_column, content);
+    };
+
+    let create_time = xml_text(xml_child(timeline, "createTime"))
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let text = xml_text(xml_child(timeline, "contentDesc")).unwrap_or_default();
+    let author_username = if user_name_column.is_empty() {
+        xml_text(xml_child(timeline, "username")).unwrap_or_default()
+    } else {
+        user_name_column.to_string()
+    };
+    let media = parse_media_from_timeline(timeline);
+    let location = xml_child(timeline, "location")
+        .and_then(|n| n.attribute("poiName"))
+        .map(str::to_string)
+        .unwrap_or_default();
+
+    ParsedPost {
+        tid,
+        create_time,
+        author_username,
+        content: text,
+        media,
+        location,
+    }
+}
+
+fn post_to_value(p: ParsedPost, names: &Names) -> Value {
+    let author = if p.author_username.is_empty() {
+        String::new()
+    } else {
+        names.display(&p.author_username)
+    };
+    json!({
+        "tid": p.tid,
+        "timestamp": p.create_time,
+        "time": fmt_time(p.create_time, "%Y-%m-%d %H:%M"),
+        "author_username": p.author_username,
+        "author": author,
+        "content": p.content,
+        "media_count": p.media.len() as i64,
+        "media": p.media,
+        "location": p.location,
+    })
+}
+
+pub async fn q_sns_feed(
+    db: &DbCache,
+    names: &Names,
+    limit: usize,
+    since: Option<i64>,
+    until: Option<i64>,
+    user: Option<&str>,
+) -> Result<Value> {
+    let path = db.get("sns/sns.db").await?.context("无法解密 sns.db")?;
+
+    let limit = limit.min(SNS_MAX_LIMIT);
+    let user_uname = match user {
+        Some(q) => {
+            Some(resolve_username(q, names).with_context(|| format!("找不到联系人: {}", q))?)
+        }
+        None => None,
+    };
+
+    let path2 = path.clone();
+    let parsed: Vec<ParsedPost> = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(&path2)?;
+        let sql = "SELECT tid, user_name, content FROM SnsTimeLine ORDER BY tid DESC";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1).unwrap_or_default(),
+            row.get::<_, String>(2).unwrap_or_default(),
+        )))?;
+
+        let mut scanned = 0usize;
+        let mut out: Vec<ParsedPost> = Vec::new();
+        for row in rows {
+            scanned += 1;
+            if scanned > SNS_MAX_SCAN {
+                eprintln!(
+                    "[sns_feed] scan 超过硬上限 {}，结果可能不完整。建议加 --user / --since 缩小范围。",
+                    SNS_MAX_SCAN
+                );
+                break;
+            }
+            let (tid, uname, content) = row?;
+            let p = parse_post_xml(tid, &uname, &content);
+            if let Some(u) = user_uname.as_ref() { if &p.author_username != u { continue; } }
+            if let Some(s) = since { if p.create_time < s { continue; } }
+            if let Some(u) = until { if p.create_time > u { continue; } }
+            out.push(p);
+        }
+        out.sort_by_key(|p| std::cmp::Reverse(p.create_time));
+        out.truncate(limit);
+        Ok::<_, anyhow::Error>(out)
     }).await??;
 
-    let out: Vec<Value> = rows.into_iter().map(|(ts, typ, from_u, from_n, to_u, to_n, content, feed_id, unread)| {
-        let action = match typ {
-            1 => "like",
-            2 => "comment",
-            _ => "other",
-        };
-        // 优先用 contacts 解析到的显示名（带备注），fallback 到 SNS 表里的 nickname
-        let from_disp = if !from_u.is_empty() && names.map.contains_key(&from_u) {
-            names.display(&from_u)
-        } else { from_n.clone() };
-        let to_disp = if !to_u.is_empty() && names.map.contains_key(&to_u) {
-            names.display(&to_u)
-        } else { to_n.clone() };
+    let posts: Vec<Value> = parsed
+        .into_iter()
+        .map(|p| post_to_value(p, names))
+        .collect();
+    let total = posts.len();
+    Ok(json!({ "posts": posts, "total": total }))
+}
 
-        let mut obj = serde_json::Map::new();
-        obj.insert("time".into(), json!(fmt_time(ts, "%Y-%m-%d %H:%M")));
-        obj.insert("timestamp".into(), json!(ts));
-        obj.insert("action".into(), json!(action));
-        obj.insert("from".into(), json!(from_disp));
-        obj.insert("from_username".into(), json!(from_u));
-        obj.insert("to".into(), json!(to_disp));
-        obj.insert("feed_id".into(), json!(feed_id.to_string()));
-        if !content.is_empty() {
-            obj.insert("content".into(), json!(content));
-        }
-        if unread != 0 {
-            obj.insert("unread".into(), json!(true));
-        }
-        Value::Object(obj)
-    }).collect();
+pub async fn q_sns_search(
+    db: &DbCache,
+    names: &Names,
+    keyword: &str,
+    limit: usize,
+    since: Option<i64>,
+    until: Option<i64>,
+    user: Option<&str>,
+) -> Result<Value> {
+    if keyword.trim().is_empty() {
+        anyhow::bail!("搜索关键词不能为空");
+    }
+    let path = db.get("sns/sns.db").await?.context("无法解密 sns.db")?;
 
-    Ok(json!({ "count": out.len(), "inbox": out }))
+    let limit = limit.min(SNS_MAX_LIMIT);
+    let user_uname = match user {
+        Some(q) => {
+            Some(resolve_username(q, names).with_context(|| format!("找不到联系人: {}", q))?)
+        }
+        None => None,
+    };
+
+    let like_pattern = format!("%{}%", escape_like_pattern(keyword));
+    let keyword_owned = keyword.to_string();
+
+    let path2 = path.clone();
+    let parsed: Vec<ParsedPost> = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(&path2)?;
+        let sql = "SELECT tid, user_name, content FROM SnsTimeLine \
+                   WHERE content LIKE ? ESCAPE '\\' ORDER BY tid DESC";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([&like_pattern], |row| Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1).unwrap_or_default(),
+            row.get::<_, String>(2).unwrap_or_default(),
+        )))?;
+
+        let needle = keyword_owned.to_lowercase();
+        let mut scanned = 0usize;
+        let mut out: Vec<ParsedPost> = Vec::new();
+        for row in rows {
+            scanned += 1;
+            if scanned > SNS_MAX_SCAN {
+                eprintln!(
+                    "[sns_search] scan 超过硬上限 {}，结果可能不完整。建议缩小 keyword 或加 --user / --since。",
+                    SNS_MAX_SCAN
+                );
+                break;
+            }
+            let (tid, uname, content) = row?;
+            let desc = extract_xml_text(&content, "contentDesc").unwrap_or_default();
+            if !desc.to_lowercase().contains(&needle) { continue; }
+
+            let p = parse_post_xml(tid, &uname, &content);
+            if let Some(u) = user_uname.as_ref() { if &p.author_username != u { continue; } }
+            if let Some(s) = since { if p.create_time < s { continue; } }
+            if let Some(u) = until { if p.create_time > u { continue; } }
+            out.push(p);
+        }
+        out.sort_by_key(|p| std::cmp::Reverse(p.create_time));
+        out.truncate(limit);
+        Ok::<_, anyhow::Error>(out)
+    }).await??;
+
+    let posts: Vec<Value> = parsed
+        .into_iter()
+        .map(|p| post_to_value(p, names))
+        .collect();
+    let total = posts.len();
+    Ok(json!({ "keyword": keyword, "posts": posts, "total": total }))
 }
 
 /// 查询好友申请历史（来自 general.db 的 FMessageTable）。
@@ -2318,66 +3054,97 @@ pub async fn q_friend_requests(
     until: Option<i64>,
     direction: Option<String>,
 ) -> Result<Value> {
-    let path = db.get("general/general.db").await?
+    let path = db
+        .get("general/general.db")
+        .await?
         .context("无法解密 general.db")?;
 
     let dir_filter: Option<i64> = match direction.as_deref() {
         Some("incoming") | Some("received") => Some(0),
-        Some("outgoing") | Some("sent")     => Some(1),
+        Some("outgoing") | Some("sent") => Some(1),
         _ => None,
     };
 
-    let rows: Vec<(String, i64, i64, String, i64, i64, String)>
-        = tokio::task::spawn_blocking(move || {
-        let conn = Connection::open(&path)?;
-        let mut clauses: Vec<&'static str> = Vec::new();
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(s) = since { clauses.push("timestamp_ >= ?"); params.push(Box::new(s)); }
-        if let Some(u) = until { clauses.push("timestamp_ <= ?"); params.push(Box::new(u)); }
-        if let Some(d) = dir_filter { clauses.push("is_sender_ = ?"); params.push(Box::new(d)); }
-        let where_clause = if clauses.is_empty() { String::new() }
-            else { format!("WHERE {}", clauses.join(" AND ")) };
-        params.push(Box::new(limit as i64));
+    let rows: Vec<(String, i64, i64, String, i64, i64, String)> =
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&path)?;
+            let mut clauses: Vec<&'static str> = Vec::new();
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            if let Some(s) = since {
+                clauses.push("timestamp_ >= ?");
+                params.push(Box::new(s));
+            }
+            if let Some(u) = until {
+                clauses.push("timestamp_ <= ?");
+                params.push(Box::new(u));
+            }
+            if let Some(d) = dir_filter {
+                clauses.push("is_sender_ = ?");
+                params.push(Box::new(d));
+            }
+            let where_clause = if clauses.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", clauses.join(" AND "))
+            };
+            params.push(Box::new(limit as i64));
 
-        let sql = format!(
-            "SELECT user_name_, type_, timestamp_, content_, is_sender_, scene_, remark_ \
+            let sql = format!(
+                "SELECT user_name_, type_, timestamp_, content_, is_sender_, scene_, remark_ \
              FROM FMessageTable {} ORDER BY timestamp_ DESC LIMIT ?",
-            where_clause
-        );
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows: Vec<_> = stmt.query_map(params_ref.as_slice(), |r| Ok((
-            r.get::<_, String>(0).unwrap_or_default(),
-            r.get::<_, i64>(1).unwrap_or(0),
-            r.get::<_, i64>(2).unwrap_or(0),
-            r.get::<_, String>(3).unwrap_or_default(),
-            r.get::<_, i64>(4).unwrap_or(0),
-            r.get::<_, i64>(5).unwrap_or(0),
-            r.get::<_, String>(6).unwrap_or_default(),
-        )))?.filter_map(|r| r.ok()).collect();
-        Ok::<_, anyhow::Error>(rows)
-    }).await??;
+                where_clause
+            );
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows: Vec<_> = stmt
+                .query_map(params_ref.as_slice(), |r| {
+                    Ok((
+                        r.get::<_, String>(0).unwrap_or_default(),
+                        r.get::<_, i64>(1).unwrap_or(0),
+                        r.get::<_, i64>(2).unwrap_or(0),
+                        r.get::<_, String>(3).unwrap_or_default(),
+                        r.get::<_, i64>(4).unwrap_or(0),
+                        r.get::<_, i64>(5).unwrap_or(0),
+                        r.get::<_, String>(6).unwrap_or_default(),
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok::<_, anyhow::Error>(rows)
+        })
+        .await??;
 
-    let out: Vec<Value> = rows.into_iter().map(|(uname, type_, ts, content, is_sender, scene, remark)| {
-        let direction = if is_sender == 1 { "outgoing" } else { "incoming" };
-        // 已成为好友的话能解析到显示名
-        let display = if names.map.contains_key(&uname) { names.display(&uname) }
-            else { uname.clone() };
-        let mut obj = serde_json::Map::new();
-        obj.insert("time".into(), json!(fmt_time(ts, "%Y-%m-%d %H:%M")));
-        obj.insert("timestamp".into(), json!(ts));
-        obj.insert("direction".into(), json!(direction));
-        obj.insert("contact".into(), json!(display));
-        obj.insert("username".into(), json!(uname.clone()));
-        obj.insert("content".into(), json!(content));
-        obj.insert("scene".into(), json!(scene_str(scene)));
-        obj.insert("type".into(), json!(fm_type_str(type_)));
-        if !remark.is_empty() {
-            obj.insert("remark".into(), json!(remark));
-        }
-        obj.insert("now_friend".into(), json!(names.map.contains_key(&uname)));
-        Value::Object(obj)
-    }).collect();
+    let out: Vec<Value> = rows
+        .into_iter()
+        .map(|(uname, type_, ts, content, is_sender, scene, remark)| {
+            let direction = if is_sender == 1 {
+                "outgoing"
+            } else {
+                "incoming"
+            };
+            // 已成为好友的话能解析到显示名
+            let display = if names.map.contains_key(&uname) {
+                names.display(&uname)
+            } else {
+                uname.clone()
+            };
+            let mut obj = serde_json::Map::new();
+            obj.insert("time".into(), json!(fmt_time(ts, "%Y-%m-%d %H:%M")));
+            obj.insert("timestamp".into(), json!(ts));
+            obj.insert("direction".into(), json!(direction));
+            obj.insert("contact".into(), json!(display));
+            obj.insert("username".into(), json!(uname.clone()));
+            obj.insert("content".into(), json!(content));
+            obj.insert("scene".into(), json!(scene_str(scene)));
+            obj.insert("type".into(), json!(fm_type_str(type_)));
+            if !remark.is_empty() {
+                obj.insert("remark".into(), json!(remark));
+            }
+            obj.insert("now_friend".into(), json!(names.map.contains_key(&uname)));
+            Value::Object(obj)
+        })
+        .collect();
 
     Ok(json!({ "count": out.len(), "requests": out }))
 }
@@ -2385,11 +3152,11 @@ pub async fn q_friend_requests(
 /// 添加场景（FMessageTable.scene_）→ 中文描述
 fn scene_str(s: i64) -> &'static str {
     match s {
-        1  => "QQ好友",
-        3  => "微信号搜索",
-        6  => "QQ群",
-        7  => "群聊",
-        8  => "扫一扫",
+        1 => "QQ好友",
+        3 => "微信号搜索",
+        6 => "QQ群",
+        7 => "群聊",
+        8 => "扫一扫",
         14 => "群聊",
         15 => "名片分享",
         17 => "附近的人/摇一摇",
@@ -2399,7 +3166,7 @@ fn scene_str(s: i64) -> &'static str {
         27 => "搜索手机号",
         29 => "附近的人",
         30 => "手机通讯录",
-        _  => "其他",
+        _ => "其他",
     }
 }
 
@@ -2409,7 +3176,7 @@ fn fm_type_str(t: i64) -> &'static str {
         38 => "推荐名片",
         40 => "认证回复",
         65 => "申请通过",
-        _  => "其他",
+        _ => "其他",
     }
 }
 
@@ -2530,8 +3297,17 @@ mod tests {
         assert_eq!(summary.summary.sent_total_cents, 50_000);
         assert_eq!(summary.summary.received_count, 1);
         assert_eq!(summary.summary.sent_count, 1);
-        assert_eq!(summary.monthly.get("1970-01").map(|b| b.received_total_cents), Some(407_500));
-        assert_eq!(summary.monthly.get("1970-01").map(|b| b.sent_total_cents), Some(50_000));
+        assert_eq!(
+            summary
+                .monthly
+                .get("1970-01")
+                .map(|b| b.received_total_cents),
+            Some(407_500)
+        );
+        assert_eq!(
+            summary.monthly.get("1970-01").map(|b| b.sent_total_cents),
+            Some(50_000)
+        );
         assert_eq!(summary.skipped, 0);
         assert!(summary.excluded_transfers.is_empty());
         assert_eq!(summary.transfers[0]["transfer_id"].as_str(), Some("t-in"));
@@ -2544,18 +3320,16 @@ mod tests {
     fn summarize_transfer_messages_excludes_status_only_rows() {
         let summary = summarize_transfer_messages(
             "wangchenfei123",
-            vec![
-                transfer_message(
-                    30,
-                    5,
-                    "wangchenfei123",
-                    "t-orphan",
-                    "4",
-                    150_000,
-                    "kuen133",
-                    "收到转账1500.00元",
-                ),
-            ],
+            vec![transfer_message(
+                30,
+                5,
+                "wangchenfei123",
+                "t-orphan",
+                "4",
+                150_000,
+                "kuen133",
+                "收到转账1500.00元",
+            )],
         );
 
         assert!(summary.transfers.is_empty());
@@ -2563,8 +3337,14 @@ mod tests {
         assert_eq!(summary.summary.sent_total_cents, 0);
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.excluded_transfers.len(), 1);
-        assert_eq!(summary.excluded_transfers[0]["reason"].as_str(), Some("missing_initiator_card"));
-        assert_eq!(summary.excluded_transfers[0]["transfer_id"].as_str(), Some("t-orphan"));
+        assert_eq!(
+            summary.excluded_transfers[0]["reason"].as_str(),
+            Some("missing_initiator_card")
+        );
+        assert_eq!(
+            summary.excluded_transfers[0]["transfer_id"].as_str(),
+            Some("t-orphan")
+        );
     }
 
     #[test]
@@ -2600,13 +3380,112 @@ mod tests {
         assert_eq!(summary.summary.sent_total_cents, 0);
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.excluded_transfers.len(), 1);
-        assert_eq!(summary.excluded_transfers[0]["reason"].as_str(), Some("returned_by_receiver"));
-        assert_eq!(summary.excluded_transfers[0]["transfer_id"].as_str(), Some("t-refund"));
+        assert_eq!(
+            summary.excluded_transfers[0]["reason"].as_str(),
+            Some("returned_by_receiver")
+        );
+        assert_eq!(
+            summary.excluded_transfers[0]["transfer_id"].as_str(),
+            Some("t-refund")
+        );
     }
 
     #[test]
     fn parse_sysmsg_strips_custom_link_markup() {
         let xml = r#"<sysmsg type="paymsg"><paymsg><content><![CDATA[你有一笔待接收的<_wc_custom_link_ href="weixin://">转账</_wc_custom_link_>]]></content></paymsg></sysmsg>"#;
-        assert_eq!(parse_sysmsg(xml).as_deref(), Some("[系统] 你有一笔待接收的转账"));
+        assert_eq!(
+            parse_sysmsg(xml).as_deref(),
+            Some("[系统] 你有一笔待接收的转账")
+        );
+    }
+
+    fn sns_post_xml(
+        create_time: &str,
+        desc: &str,
+        username_tag: Option<&str>,
+        media: usize,
+        location: Option<&str>,
+    ) -> String {
+        let username = username_tag
+            .map(|u| format!("<username>{}</username>", u))
+            .unwrap_or_default();
+        let media_tags = "<media><type>2</type></media>".repeat(media);
+        let content_object = if media > 0 {
+            format!(
+                "<ContentObject><mediaList>{}</mediaList></ContentObject>",
+                media_tags
+            )
+        } else {
+            String::new()
+        };
+        let loc = location
+            .map(|poi| {
+                format!(
+                    r#"<location poiName="{}" longitude="0" latitude="0" />"#,
+                    poi
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "<TimelineObject>{}<createTime>{}</createTime><contentDesc>{}</contentDesc>{}{}</TimelineObject>",
+            username, create_time, desc, content_object, loc
+        )
+    }
+
+    #[test]
+    fn parse_post_xml_prefers_column_username_and_extracts_media() {
+        let xml = sns_post_xml("1700000002", "post", Some("wxid_xml"), 3, Some("Wuxi"));
+        let parsed = parse_post_xml(4, "wxid_column", &xml);
+        assert_eq!(parsed.author_username, "wxid_column");
+        assert_eq!(parsed.create_time, 1700000002);
+        assert_eq!(parsed.content, "post");
+        assert_eq!(parsed.location, "Wuxi");
+        assert_eq!(parsed.media.len(), 3);
+    }
+
+    #[test]
+    fn parse_post_xml_falls_back_to_xml_username_when_column_missing() {
+        let xml = sns_post_xml("1700000001", "world", Some("wxid_xml_only"), 0, None);
+        let parsed = parse_post_xml(2, "", &xml);
+        assert_eq!(parsed.author_username, "wxid_xml_only");
+    }
+
+    #[test]
+    fn parse_post_xml_fallback_decodes_entities_for_broken_xml() {
+        let xml = "<TimelineObject><createTime>1700000007</createTime><contentDesc>A &amp; B</contentDesc><location poiName=\"Wuxi &amp; Lake\" /><not valid xml";
+        let parsed = parse_post_xml(7, "wxid_fallback", xml);
+        assert_eq!(parsed.author_username, "wxid_fallback");
+        assert_eq!(parsed.content, "A & B");
+        assert_eq!(parsed.location, "Wuxi & Lake");
+    }
+
+    #[test]
+    fn parse_post_media_extracts_structured_fields() {
+        let xml = r#"
+<TimelineObject>
+  <ContentObject>
+    <mediaList>
+      <media>
+        <type>2</type>
+        <url md5="abc" key="uk" token="ut" enc_idx="1">https://example.com/full.jpg</url>
+        <thumb key="tk" token="tt" enc_idx="2">https://example.com/thumb.jpg</thumb>
+        <size width="1080" height="720" totalSize="2048" />
+      </media>
+    </mediaList>
+  </ContentObject>
+</TimelineObject>
+"#;
+        let media = parse_post_media(xml);
+        assert_eq!(media.len(), 1);
+        assert_eq!(
+            media[0]["url"].as_str(),
+            Some("https://example.com/full.jpg")
+        );
+        assert_eq!(
+            media[0]["thumb"].as_str(),
+            Some("https://example.com/thumb.jpg")
+        );
+        assert_eq!(media[0]["width"].as_i64(), Some(1080));
+        assert_eq!(media[0]["md5"].as_str(), Some("abc"));
     }
 }

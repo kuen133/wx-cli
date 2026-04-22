@@ -18,9 +18,7 @@ pub fn cmd_asr_backfill(
     let until_ts = until.as_deref().map(parse_time_end).transpose()?;
 
     let rt = tokio::runtime::Runtime::new().context("无法创建 tokio runtime")?;
-    let value = rt.block_on(async {
-        run_backfill(limit, since_ts, until_ts, dry_run).await
-    })?;
+    let value = rt.block_on(async { run_backfill(limit, since_ts, until_ts, dry_run).await })?;
     print_value(&value, &resolve(json_output))
 }
 
@@ -84,10 +82,7 @@ async fn run_backfill(
         if done == 1 || done % 25 == 0 || done == estimate.pending_messages {
             eprintln!(
                 "[asr-backfill] 进度 {}/{}，成功 {}，失败 {}",
-                done,
-                estimate.pending_messages,
-                transcribed_now,
-                failed
+                done, estimate.pending_messages, transcribed_now, failed
             );
         }
     }

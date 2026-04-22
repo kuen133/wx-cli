@@ -16,33 +16,45 @@ pub fn load_config() -> Result<Config> {
     let config_path = find_config_file()?;
     let content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("读取 config.json 失败: {}", config_path.display()))?;
-    let raw: serde_json::Value = serde_json::from_str(&content)
-        .with_context(|| "config.json 格式错误")?;
+    let raw: serde_json::Value =
+        serde_json::from_str(&content).with_context(|| "config.json 格式错误")?;
 
-    let db_dir = raw.get("db_dir")
+    let db_dir = raw
+        .get("db_dir")
         .and_then(|v| v.as_str())
         .map(PathBuf::from)
         .unwrap_or_else(default_db_dir);
 
     let base_dir = config_path.parent().unwrap_or(Path::new("."));
 
-    let keys_file = raw.get("keys_file")
+    let keys_file = raw
+        .get("keys_file")
         .and_then(|v| v.as_str())
         .map(|s| {
             let p = PathBuf::from(s);
-            if p.is_absolute() { p } else { base_dir.join(p) }
+            if p.is_absolute() {
+                p
+            } else {
+                base_dir.join(p)
+            }
         })
         .unwrap_or_else(|| base_dir.join("all_keys.json"));
 
-    let decrypted_dir = raw.get("decrypted_dir")
+    let decrypted_dir = raw
+        .get("decrypted_dir")
         .and_then(|v| v.as_str())
         .map(|s| {
             let p = PathBuf::from(s);
-            if p.is_absolute() { p } else { base_dir.join(p) }
+            if p.is_absolute() {
+                p
+            } else {
+                base_dir.join(p)
+            }
         })
         .unwrap_or_else(|| base_dir.join("decrypted"));
 
-    let wechat_process = raw.get("wechat_process")
+    let wechat_process = raw
+        .get("wechat_process")
         .and_then(|v| v.as_str())
         .unwrap_or(default_wechat_process())
         .to_string();
@@ -66,7 +78,9 @@ fn find_config_file() -> Result<PathBuf> {
         }
     }
     // 2. 当前工作目录
-    let cwd = std::env::current_dir().unwrap_or_default().join("config.json");
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .join("config.json");
     if cwd.exists() {
         return Ok(cwd);
     }
@@ -127,8 +141,7 @@ fn default_db_dir() -> PathBuf {
     }
     #[cfg(target_os = "windows")]
     {
-        PathBuf::from(std::env::var("APPDATA").unwrap_or_default())
-            .join("Tencent/xwechat")
+        PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("Tencent/xwechat")
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -138,13 +151,21 @@ fn default_db_dir() -> PathBuf {
 
 fn default_wechat_process() -> &'static str {
     #[cfg(target_os = "macos")]
-    { "WeChat" }
+    {
+        "WeChat"
+    }
     #[cfg(target_os = "linux")]
-    { "wechat" }
+    {
+        "wechat"
+    }
     #[cfg(target_os = "windows")]
-    { "Weixin.exe" }
+    {
+        "Weixin.exe"
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    { "WeChat" }
+    {
+        "WeChat"
+    }
 }
 
 /// 自动检测微信 db_storage 目录
@@ -192,7 +213,9 @@ fn latest_db_mtime(db_storage: &std::path::Path) -> std::time::SystemTime {
     if let Ok(entries) = std::fs::read_dir(&session_dir) {
         for entry in entries.flatten() {
             if let Ok(m) = entry.metadata().and_then(|m| m.modified()) {
-                if m > latest { latest = m; }
+                if m > latest {
+                    latest = m;
+                }
             }
         }
     }
@@ -208,7 +231,8 @@ fn latest_db_mtime(db_storage: &std::path::Path) -> std::time::SystemTime {
 #[cfg(target_os = "linux")]
 fn detect_db_dir_impl() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    let sudo_home = std::env::var("SUDO_USER").ok()
+    let sudo_home = std::env::var("SUDO_USER")
+        .ok()
         .filter(|s| !s.is_empty())
         .map(|u| PathBuf::from("/home").join(u));
 
@@ -253,8 +277,7 @@ fn detect_db_dir_impl() -> Option<PathBuf> {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     let data_root = content.trim().to_string();
                     if PathBuf::from(&data_root).is_dir() {
-                        let pattern = PathBuf::from(&data_root)
-                            .join("xwechat_files");
+                        let pattern = PathBuf::from(&data_root).join("xwechat_files");
                         if let Ok(entries2) = std::fs::read_dir(&pattern) {
                             for entry2 in entries2.flatten() {
                                 let storage = entry2.path().join("db_storage");

@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// CLI 向 daemon 发送的请求（换行符分隔 JSON，与 Python 版兼容）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +115,42 @@ pub enum Request {
         #[serde(default)]
         unread_only: bool,
     },
+    /// 朋友圈互动通知（点赞 + 评论）
+    SnsNotifications {
+        #[serde(default = "default_limit_50")]
+        limit: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+        /// 包含已读通知（默认仅未读）
+        #[serde(default)]
+        include_read: bool,
+    },
+    /// 朋友圈时间线（按时间 / 作者筛选帖子）
+    SnsFeed {
+        #[serde(default = "default_limit_20")]
+        limit: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+        /// 作者昵称 / 备注名 / 微信 username，模糊匹配
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+    },
+    /// 朋友圈全文搜索（匹配 contentDesc）
+    SnsSearch {
+        keyword: String,
+        #[serde(default = "default_limit_20")]
+        limit: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+    },
     FriendRequests {
         #[serde(default = "default_limit_50")]
         limit: usize,
@@ -128,7 +164,6 @@ pub enum Request {
     },
 }
 
-
 /// daemon 的响应
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
@@ -141,11 +176,19 @@ pub struct Response {
 
 impl Response {
     pub fn ok(data: Value) -> Self {
-        Self { ok: true, error: None, data }
+        Self {
+            ok: true,
+            error: None,
+            data,
+        }
     }
 
     pub fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, error: Some(msg.into()), data: Value::Null }
+        Self {
+            ok: false,
+            error: Some(msg.into()),
+            data: Value::Null,
+        }
     }
 
     pub fn to_json_line(&self) -> anyhow::Result<String> {
@@ -154,6 +197,12 @@ impl Response {
     }
 }
 
-fn default_limit_20() -> usize { 20 }
-fn default_limit_50() -> usize { 50 }
-fn default_limit_200() -> usize { 200 }
+fn default_limit_20() -> usize {
+    20
+}
+fn default_limit_50() -> usize {
+    50
+}
+fn default_limit_200() -> usize {
+    200
+}
