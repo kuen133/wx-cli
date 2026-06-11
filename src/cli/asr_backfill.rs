@@ -1,11 +1,17 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::sync::Arc;
+use tokio::task::JoinSet;
 
 use crate::config;
 use crate::daemon::{self, cache::DbCache, query, voice_asr};
 
 use super::history::{parse_time, parse_time_end};
 use super::output::{print_value, resolve};
+
+const DEFAULT_ASR_CONCURRENCY: usize = 4;
+const MAX_ASR_CONCURRENCY: usize = 16;
+const ASR_PROGRESS_INTERVAL: usize = 25;
 
 pub fn cmd_asr_backfill(
     limit: Option<usize>,
@@ -43,46 +49,61 @@ async fn run_backfill(
         return Ok(summary);
     }
 
+    let concurrency = asr_concurrency();
     eprintln!(
-        "[asr-backfill] 开始预转写 {} 条未缓存语音，预计音频时长 {:.2} 分钟...",
+        "[asr-backfill] 开始预转写 {} 条未缓存语音，预计音频时长 {:.2} 分钟，并发度 {}...",
         estimate.pending_messages,
-        estimate.pending_seconds / 60.0
+        estimate.pending_seconds / 60.0,
+        concurrency
     );
 
     let mut transcribed_now = 0usize;
     let mut failed = 0usize;
     let mut error_examples = Vec::new();
 
-    for (idx, target) in estimate.pending_targets.iter().enumerate() {
-        match voice_asr::transcribe_voice_message(
-            &db,
-            &target.chat_username,
-            target.local_id,
-            target.create_time,
-        )
-        .await
-        {
-            Ok(_) => {
+    let cached_messages = estimate.cached_messages;
+    let pending_messages = estimate.pending_messages;
+    let mut pending_targets = estimate.pending_targets.into_iter();
+    let db = Arc::new(db);
+    let mut join_set = JoinSet::new();
+
+    for _ in 0..concurrency {
+        let Some(target) = pending_targets.next() else {
+            break;
+        };
+        spawn_transcribe_task(&mut join_set, db.clone(), target);
+    }
+
+    let mut done = 0usize;
+    while let Some(joined) = join_set.join_next().await {
+        done += 1;
+        match joined {
+            Ok((target, Ok(()))) => {
                 transcribed_now += 1;
+                drop(target);
+            }
+            Ok((target, Err(err))) => {
+                failed += 1;
+                push_error_example(&mut error_examples, &target, err.to_string());
             }
             Err(err) => {
                 failed += 1;
                 if error_examples.len() < 20 {
                     error_examples.push(json!({
-                        "chat_username": target.chat_username,
-                        "local_id": target.local_id,
-                        "timestamp": target.create_time,
-                        "error": err.to_string(),
+                        "error": format!("转写任务 join 失败: {}", err),
                     }));
                 }
             }
         }
 
-        let done = idx + 1;
-        if done == 1 || done % 25 == 0 || done == estimate.pending_messages {
+        if let Some(target) = pending_targets.next() {
+            spawn_transcribe_task(&mut join_set, db.clone(), target);
+        }
+
+        if done == 1 || done % ASR_PROGRESS_INTERVAL == 0 || done == pending_messages {
             eprintln!(
                 "[asr-backfill] 进度 {}/{}，成功 {}，失败 {}",
-                done, estimate.pending_messages, transcribed_now, failed
+                done, pending_messages, transcribed_now, failed
             );
         }
     }
@@ -94,15 +115,60 @@ async fn run_backfill(
         obj.insert("error_examples".into(), Value::Array(error_examples));
         obj.insert(
             "cache_after_run".into(),
-            json!(estimate.cached_messages + transcribed_now),
+            json!(cached_messages + transcribed_now),
         );
         obj.insert(
             "pending_after_run".into(),
-            json!(estimate.pending_messages.saturating_sub(transcribed_now)),
+            json!(pending_messages.saturating_sub(transcribed_now)),
         );
     }
 
     Ok(summary)
+}
+
+fn asr_concurrency() -> usize {
+    let raw = std::env::var("WX_ASR_CONCURRENCY").ok();
+    parse_asr_concurrency(raw.as_deref())
+}
+
+fn parse_asr_concurrency(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(MAX_ASR_CONCURRENCY))
+        .unwrap_or(DEFAULT_ASR_CONCURRENCY)
+}
+
+fn spawn_transcribe_task(
+    join_set: &mut JoinSet<(voice_asr::VoiceBackfillTarget, Result<()>)>,
+    db: Arc<DbCache>,
+    target: voice_asr::VoiceBackfillTarget,
+) {
+    join_set.spawn(async move {
+        let result = voice_asr::transcribe_voice_message(
+            &db,
+            &target.chat_username,
+            target.local_id,
+            target.create_time,
+        )
+        .await
+        .map(|_| ());
+        (target, result)
+    });
+}
+
+fn push_error_example(
+    error_examples: &mut Vec<Value>,
+    target: &voice_asr::VoiceBackfillTarget,
+    error: String,
+) {
+    if error_examples.len() < 20 {
+        error_examples.push(json!({
+            "chat_username": target.chat_username,
+            "local_id": target.local_id,
+            "timestamp": target.create_time,
+            "error": error,
+        }));
+    }
 }
 
 async fn load_runtime_context() -> Result<(DbCache, query::Names)> {
@@ -158,4 +224,43 @@ fn summary_value(
 
 fn round4(value: f64) -> f64 {
     (value * 10_000.0).round() / 10_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_asr_concurrency_defaults_and_caps_env_values() {
+        assert_eq!(parse_asr_concurrency(None), DEFAULT_ASR_CONCURRENCY);
+        assert_eq!(parse_asr_concurrency(Some("")), DEFAULT_ASR_CONCURRENCY);
+        assert_eq!(parse_asr_concurrency(Some("0")), DEFAULT_ASR_CONCURRENCY);
+        assert_eq!(
+            parse_asr_concurrency(Some("not-a-number")),
+            DEFAULT_ASR_CONCURRENCY
+        );
+        assert_eq!(parse_asr_concurrency(Some("2")), 2);
+        assert_eq!(parse_asr_concurrency(Some("128")), MAX_ASR_CONCURRENCY);
+    }
+
+    #[test]
+    fn summary_value_keeps_dry_run_from_reporting_real_transcribes() {
+        let estimate = voice_asr::VoiceBackfillEstimate {
+            total_messages: 3,
+            cached_messages: 1,
+            pending_messages: 2,
+            unresolved_messages: 0,
+            pending_seconds: 12.34567,
+            pending_cost_usd: 0.01234,
+            price_per_second_usd: 0.001,
+            pending_targets: Vec::new(),
+        };
+
+        let value = summary_value(&estimate, true, Some(10), Some(20), Some(30));
+
+        assert_eq!(value["dry_run"], true);
+        assert_eq!(value["pending_messages"], 2);
+        assert!(value.get("transcribed_now").is_none());
+        assert!(value.get("failed").is_none());
+    }
 }

@@ -1,13 +1,15 @@
 use anyhow::{Context, Result};
 use chrono::Local;
 use regex::Regex;
+use rusqlite::types::ToSql;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::config;
 
@@ -19,10 +21,18 @@ const DEFAULT_ASR_MODEL: &str = "qwen3-asr-flash";
 const DEFAULT_SILK_SAMPLE_RATE: &str = "24000";
 const DEFAULT_MAINLAND_PRICE_PER_SECOND_USD: f64 = 0.000032;
 
+#[derive(Debug, Clone)]
 pub struct VoiceTranscript {
     pub text: String,
     pub model: String,
     pub cached: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VoiceCacheKey {
+    chat_username: String,
+    local_id: i64,
+    create_time: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +60,15 @@ pub async fn enrich_history_messages(
     messages: &mut [Value],
     transcribe_missing: bool,
 ) {
+    if !transcribe_missing {
+        if let Err(err) =
+            enrich_cached_history_messages_from_path(chat_username, messages, cache_db_path()).await
+        {
+            annotate_voice_messages_with_error_text(messages, err.to_string());
+        }
+        return;
+    }
+
     for message in messages.iter_mut() {
         let is_voice = message.get("type").and_then(Value::as_str) == Some("语音");
         if !is_voice {
@@ -65,20 +84,73 @@ pub async fn enrich_history_messages(
             .and_then(Value::as_i64)
             .unwrap_or(0);
 
-        if transcribe_missing {
-            match transcribe_voice_message(db, chat_username, local_id, timestamp).await {
-                Ok(transcript) => annotate_message_with_transcript(message, transcript),
-                Err(err) => annotate_message_with_error(message, err),
-            }
-            continue;
-        }
-
-        match cached_transcript(chat_username, local_id, timestamp).await {
-            Ok(Some(transcript)) => annotate_message_with_transcript(message, transcript),
-            Ok(None) => {}
+        match transcribe_voice_message(db, chat_username, local_id, timestamp).await {
+            Ok(transcript) => annotate_message_with_transcript(message, transcript),
             Err(err) => annotate_message_with_error(message, err),
         }
     }
+}
+
+async fn enrich_cached_history_messages_from_path(
+    chat_username: &str,
+    messages: &mut [Value],
+    cache_path: PathBuf,
+) -> Result<()> {
+    let keys = collect_voice_cache_keys(chat_username, messages);
+    if keys.is_empty() {
+        return Ok(());
+    }
+
+    let transcripts = cached_transcripts_from_path(keys, cache_path).await?;
+    for message in messages.iter_mut() {
+        let Some(key) = voice_cache_key_from_message(chat_username, message) else {
+            continue;
+        };
+        if let Some(transcript) = transcripts.get(&key) {
+            annotate_message_with_transcript(message, transcript.clone());
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_voice_cache_keys(chat_username: &str, messages: &[Value]) -> Vec<VoiceCacheKey> {
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for message in messages {
+        let Some(key) = voice_cache_key_from_message(chat_username, message) else {
+            continue;
+        };
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+fn voice_cache_key_from_message(chat_username: &str, message: &Value) -> Option<VoiceCacheKey> {
+    let is_voice = message.get("type").and_then(Value::as_str) == Some("语音");
+    if !is_voice {
+        return None;
+    }
+
+    let local_id = message.get("local_id").and_then(Value::as_i64)?;
+    let create_time = message
+        .get("timestamp")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    Some(VoiceCacheKey {
+        chat_username: chat_username.to_string(),
+        local_id,
+        create_time,
+    })
+}
+
+async fn cached_transcripts_from_path(
+    keys: Vec<VoiceCacheKey>,
+    cache_path: PathBuf,
+) -> Result<HashMap<VoiceCacheKey, VoiceTranscript>> {
+    tokio::task::spawn_blocking(move || read_cache_entries_from_path(&cache_path, &keys)).await?
 }
 
 pub async fn list_history_voice_targets(
@@ -620,9 +692,22 @@ fn annotate_message_with_transcript(message: &mut Value, transcript: VoiceTransc
 }
 
 fn annotate_message_with_error(message: &mut Value, err: anyhow::Error) {
+    annotate_message_with_error_text(message, err.to_string());
+}
+
+fn annotate_voice_messages_with_error_text(messages: &mut [Value], error: String) {
+    for message in messages {
+        let is_voice = message.get("type").and_then(Value::as_str) == Some("语音");
+        if is_voice && message.get("local_id").and_then(Value::as_i64).is_some() {
+            annotate_message_with_error_text(message, error.clone());
+        }
+    }
+}
+
+fn annotate_message_with_error_text(message: &mut Value, error: String) {
     if let Some(obj) = message.as_object_mut() {
         obj.insert("voice_status".into(), Value::String("error".into()));
-        obj.insert("voice_error".into(), Value::String(err.to_string()));
+        obj.insert("voice_error".into(), Value::String(error));
     }
 }
 
@@ -645,14 +730,20 @@ fn ensure_cache_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn open_cache_connection(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(Duration::from_secs(10))?;
+    ensure_cache_schema(&conn)?;
+    Ok(conn)
+}
+
 fn read_cache_entry(
     chat_username: &str,
     local_id: i64,
     create_time: i64,
 ) -> Result<Option<(String, String)>> {
     let path = cache_db_path();
-    let conn = Connection::open(path)?;
-    ensure_cache_schema(&conn)?;
+    let conn = open_cache_connection(&path)?;
     let row = conn
         .query_row(
             "SELECT transcript, model
@@ -665,6 +756,70 @@ fn read_cache_entry(
     Ok(row)
 }
 
+fn read_cache_entries_from_path(
+    path: &Path,
+    keys: &[VoiceCacheKey],
+) -> Result<HashMap<VoiceCacheKey, VoiceTranscript>> {
+    let mut result = HashMap::new();
+    if keys.is_empty() {
+        return Ok(result);
+    }
+
+    let conn = open_cache_connection(path)?;
+    let mut grouped: HashMap<&str, Vec<&VoiceCacheKey>> = HashMap::new();
+    for key in keys {
+        grouped
+            .entry(key.chat_username.as_str())
+            .or_default()
+            .push(key);
+    }
+
+    for (chat_username, chat_keys) in grouped {
+        for chunk in chat_keys.chunks(400) {
+            let placeholders = std::iter::repeat("(?, ?)")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT chat_username, local_id, create_time, transcript, model
+                 FROM voice_asr_cache
+                 WHERE chat_username = ?
+                   AND (local_id, create_time) IN ({})",
+                placeholders
+            );
+
+            let mut params: Vec<&dyn ToSql> = Vec::with_capacity(1 + chunk.len() * 2);
+            params.push(&chat_username);
+            for key in chunk {
+                params.push(&key.local_id);
+                params.push(&key.create_time);
+            }
+
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                let key = VoiceCacheKey {
+                    chat_username: row.get(0)?,
+                    local_id: row.get(1)?,
+                    create_time: row.get(2)?,
+                };
+                let transcript = VoiceTranscript {
+                    text: row.get(3)?,
+                    model: row.get(4)?,
+                    cached: true,
+                };
+                Ok((key, transcript))
+            })?;
+
+            for row in rows {
+                let (key, transcript) = row?;
+                result.insert(key, transcript);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 fn write_cache_entry(
     chat_username: &str,
     local_id: i64,
@@ -672,9 +827,11 @@ fn write_cache_entry(
     transcript: &str,
     model: &str,
 ) -> Result<()> {
+    let _guard = cache_write_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
     let path = cache_db_path();
-    let conn = Connection::open(path)?;
-    ensure_cache_schema(&conn)?;
+    let conn = open_cache_connection(&path)?;
     conn.execute(
         "INSERT INTO voice_asr_cache (
             chat_username, local_id, create_time, transcript, model, updated_at
@@ -694,6 +851,11 @@ fn write_cache_entry(
         ],
     )?;
     Ok(())
+}
+
+fn cache_write_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 fn sanitize_for_filename(input: &str) -> String {
@@ -723,4 +885,84 @@ fn current_asr_price_per_second_usd() -> f64 {
         .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|value| *value > 0.0)
         .unwrap_or(DEFAULT_MAINLAND_PRICE_PER_SECOND_USD)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_tmpdir(tag: &str) -> PathBuf {
+        let unique = format!(
+            "wx-cli-voice-asr-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn insert_cache_row(
+        conn: &Connection,
+        chat_username: &str,
+        local_id: i64,
+        create_time: i64,
+        transcript: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO voice_asr_cache (
+                chat_username, local_id, create_time, transcript, model, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 'test-model', 100)",
+            params![chat_username, local_id, create_time, transcript],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn enrich_cached_history_messages_batches_and_leaves_uncached_unchanged() {
+        let root = unique_tmpdir("batch-cache");
+        let cache_path = root.join("_voice_asr.db");
+        let conn = Connection::open(&cache_path).unwrap();
+        ensure_cache_schema(&conn).unwrap();
+        insert_cache_row(&conn, "chat_a", 1, 1000, "cached one");
+        insert_cache_row(&conn, "chat_a", 3, 3000, "cached three");
+        insert_cache_row(&conn, "chat_b", 2, 2000, "wrong chat");
+
+        let mut messages = vec![
+            json!({"type": "语音", "local_id": 1, "timestamp": 1000, "content": "[语音]"}),
+            json!({"type": "语音", "local_id": 2, "timestamp": 2000, "content": "[语音]"}),
+            json!({"type": "文本", "local_id": 3, "timestamp": 3000, "content": "hello"}),
+            json!({"type": "语音", "local_id": 3, "timestamp": 3000, "content": "[语音]"}),
+            json!({"type": "语音", "timestamp": 4000, "content": "[语音]"}),
+        ];
+
+        enrich_cached_history_messages_from_path("chat_a", &mut messages, cache_path)
+            .await
+            .unwrap();
+
+        assert_eq!(messages[0]["content"], "[语音] cached one");
+        assert_eq!(messages[0]["voice_text"], "cached one");
+        assert_eq!(messages[0]["voice_model"], "test-model");
+        assert_eq!(messages[0]["voice_status"], "cached");
+        assert_eq!(messages[0]["voice_cached"], true);
+
+        assert!(messages[1].get("voice_text").is_none());
+        assert_eq!(messages[1]["content"], "[语音]");
+
+        assert!(messages[2].get("voice_text").is_none());
+        assert_eq!(messages[2]["content"], "hello");
+
+        assert_eq!(messages[3]["content"], "[语音] cached three");
+        assert_eq!(messages[3]["voice_text"], "cached three");
+
+        assert!(messages[4].get("voice_text").is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
