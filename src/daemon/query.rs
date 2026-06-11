@@ -14,7 +14,7 @@ use super::cache::DbCache;
 use super::voice_asr;
 
 /// 静态编译的 Msg 表名正则，避免在热路径中重复编译
-fn msg_table_re() -> &'static Regex {
+pub(crate) fn msg_table_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^Msg_[0-9a-f]{32}$").unwrap())
 }
@@ -1442,7 +1442,7 @@ fn search_in_table(
     Ok(result)
 }
 
-fn load_id2u(conn: &Connection) -> HashMap<i64, String> {
+pub(crate) fn load_id2u(conn: &Connection) -> HashMap<i64, String> {
     let mut map = HashMap::new();
     if let Ok(mut stmt) = conn.prepare("SELECT rowid, user_name FROM Name2Id") {
         let _ = stmt
@@ -1536,7 +1536,7 @@ fn get_content_bytes(row: &rusqlite::Row<'_>, idx: usize) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-fn decompress_message(data: &[u8], ct: i64) -> String {
+pub(crate) fn decompress_message(data: &[u8], ct: i64) -> String {
     if ct == 4 && !data.is_empty() {
         // zstd 压缩
         if let Ok(dec) = zstd::decode_all(data) {
@@ -1567,7 +1567,7 @@ fn strip_group_prefix(s: &str) -> String {
     }
 }
 
-pub fn fmt_type(t: i64) -> String {
+pub(crate) fn fmt_type(t: i64) -> String {
     let base = (t as u64 & 0xFFFFFFFF) as i64;
     match base {
         1 => "文本".into(),

@@ -12,10 +12,9 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use super::cache::DbCache;
-use super::query::Names;
+use super::query::{decompress_message, fmt_type, load_id2u, msg_table_re, Names};
 
 pub struct SearchIndex {
     path: PathBuf,
@@ -274,7 +273,7 @@ impl SearchIndex {
                             "local_id": local_id,
                             "timestamp": ts,
                             "time": fmt_ts(ts),
-                            "type": fmt_local_type(local_type),
+                            "type": fmt_type(local_type),
                             "content": content,
                         })
                     },
@@ -286,10 +285,6 @@ impl SearchIndex {
 
         Ok(Some(res))
     }
-}
-
-fn msg_table_re() -> regex::Regex {
-    regex::Regex::new(r"^Msg_[0-9a-f]{32}$").unwrap()
 }
 
 fn ensure_progress_last_local_id(conn: &Connection) -> Result<()> {
@@ -317,30 +312,6 @@ fn ensure_progress_last_local_id(conn: &Connection) -> Result<()> {
     }
 }
 
-/// 与 query.rs 的同名函数对应：Name2Id 表 rowid → user_name
-fn load_id2u(conn: &Connection) -> HashMap<i64, String> {
-    let mut map = HashMap::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT rowid, user_name FROM Name2Id") {
-        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-        {
-            for r in rows.flatten() {
-                map.insert(r.0, r.1);
-            }
-        }
-    }
-    map
-}
-
-/// 与 query.rs 的同名函数对应：ct=4 时 zstd 解压
-fn decompress_message(data: &[u8], ct: i64) -> String {
-    if ct == 4 && !data.is_empty() {
-        if let Ok(dec) = zstd::decode_all(data) {
-            return String::from_utf8_lossy(&dec).into_owned();
-        }
-    }
-    String::from_utf8_lossy(data).into_owned()
-}
-
 fn fmt_ts(ts: i64) -> String {
     use chrono::{Local, TimeZone};
     Local
@@ -348,26 +319,6 @@ fn fmt_ts(ts: i64) -> String {
         .single()
         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| ts.to_string())
-}
-
-fn fmt_local_type(t: i64) -> String {
-    static MAP: OnceLock<HashMap<i64, &'static str>> = OnceLock::new();
-    let m = MAP.get_or_init(|| {
-        [
-            (1, "文本"),
-            (3, "图片"),
-            (34, "语音"),
-            (43, "视频"),
-            (47, "表情"),
-            (48, "位置"),
-            (49, "链接/文件"),
-            (50, "通话"),
-            (10000, "系统"),
-        ]
-        .into_iter()
-        .collect()
-    });
-    m.get(&t).copied().unwrap_or("其他").to_string()
 }
 
 #[cfg(test)]
@@ -479,6 +430,49 @@ mod tests {
             |r| r.get(0),
         )
         .expect("count indexed rows")
+    }
+
+    #[tokio::test]
+    async fn search_uses_query_type_names_for_fts_hits() {
+        let root = unique_tmpdir("query-type-names");
+        let index_dir = root.join("index");
+        let index = SearchIndex::new(&index_dir).expect("create search index");
+        let index_path = index_dir.join("_search_index.db");
+        {
+            let conn = Connection::open(&index_path).expect("open index db");
+            conn.execute(
+                "INSERT INTO msg_fts(content, chat_uname, sender_uname, local_id, create_time, local_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    "测试内容 needle",
+                    "room@chatroom",
+                    "wxid_sender",
+                    99_i64,
+                    1_775_146_911_i64,
+                    10002_i64
+                ],
+            )
+            .expect("insert indexed row");
+        }
+
+        let names = Names {
+            map: HashMap::from([
+                ("room@chatroom".to_string(), "Test Room".to_string()),
+                ("wxid_sender".to_string(), "Sender".to_string()),
+            ]),
+            md5_to_uname: HashMap::new(),
+            msg_db_keys: Vec::new(),
+            verify_flags: HashMap::new(),
+        };
+
+        let hits = index
+            .search("needle", None, &names, None, None, None, 10)
+            .await
+            .expect("search index")
+            .expect("fts search result");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["type"].as_str(), Some("撤回"));
     }
 
     #[tokio::test]
