@@ -15,6 +15,8 @@ pub const RESERVE_SZ: usize = 80; // IV(16) + HMAC(64)
 
 /// SQLite 文件头魔数（16字节）
 pub const SQLITE_HDR: &[u8] = b"SQLite format 3\x00";
+const FIRST_PAGE_DECRYPT_ERR: &str =
+    "解密失败：首页魔数不匹配，可能是密钥错误或 SQLCipher 页格式已变（非文件损坏）";
 
 type Aes256CbcDec = Decryptor<Aes256>;
 
@@ -93,7 +95,35 @@ pub fn full_decrypt(db_path: &Path, out_path: &Path, enc_key: &[u8; 32]) -> Resu
         let bytes_remaining = file_size.saturating_sub(page_start);
         read_page(&mut input, &mut page_buf, bytes_remaining)?;
         let dec = decrypt_page(enc_key, &page_buf, pgno as u32)?;
+        if pgno == 1 {
+            validate_first_decrypted_page(&dec)?;
+        }
         output.write_all(&dec)?;
+    }
+
+    Ok(())
+}
+
+fn validate_first_decrypted_page(page: &[u8]) -> Result<()> {
+    if page.len() < 24 || &page[..SQLITE_HDR.len()] != SQLITE_HDR {
+        bail!(FIRST_PAGE_DECRYPT_ERR);
+    }
+
+    // decrypt_page 会为第一页重建 SQLite 魔数；相邻页头字段来自 AES 明文，
+    // 一并校验才能把错误 key 的随机明文挡在写盘前。
+    let page_size = u16::from_be_bytes([page[16], page[17]]) as usize;
+    let write_version = page[18];
+    let read_version = page[19];
+    let reserved_space = page[20] as usize;
+    let payload_fractions = &page[21..24];
+
+    let valid = page_size == PAGE_SZ
+        && matches!(write_version, 1 | 2)
+        && matches!(read_version, 1 | 2)
+        && matches!(reserved_space, 0 | RESERVE_SZ)
+        && payload_fractions == [64, 32, 32];
+    if !valid {
+        bail!(FIRST_PAGE_DECRYPT_ERR);
     }
 
     Ok(())
@@ -114,8 +144,10 @@ fn read_page(
 
 #[cfg(test)]
 mod tests {
-    use super::{read_page, PAGE_SZ};
+    use super::{full_decrypt, read_page, PAGE_SZ, RESERVE_SZ, SALT_SZ, SQLITE_HDR};
+    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
     use std::io::{self, Read};
+    use std::path::PathBuf;
 
     struct ChunkedReader {
         chunks: Vec<Vec<u8>>,
@@ -149,6 +181,87 @@ mod tests {
             }
             Ok(n)
         }
+    }
+
+    fn unique_tmpdir(tag: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("wx-cli-crypto-test-{}-{}-{}", tag, pid, nanos));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn aes_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Vec<u8> {
+        assert!(!data.is_empty());
+        assert_eq!(data.len() % 16, 0);
+
+        let mut blocks: Vec<super::Block> = data
+            .chunks_exact(16)
+            .map(super::Block::clone_from_slice)
+            .collect();
+        cbc::Encryptor::<aes::Aes256>::new(key.into(), iv.into()).encrypt_blocks_mut(&mut blocks);
+        blocks.iter().flat_map(|b| b.iter().copied()).collect()
+    }
+
+    fn encrypted_first_page(key: &[u8; 32]) -> Vec<u8> {
+        let iv = [0x42; 16];
+        let mut plain = vec![0u8; PAGE_SZ];
+        plain[..SQLITE_HDR.len()].copy_from_slice(SQLITE_HDR);
+        plain[16..18].copy_from_slice(&(PAGE_SZ as u16).to_be_bytes());
+        plain[18] = 1;
+        plain[19] = 1;
+        plain[20] = 0;
+        plain[21] = 64;
+        plain[22] = 32;
+        plain[23] = 32;
+        plain[28..32].copy_from_slice(&1u32.to_be_bytes());
+        plain[44..48].copy_from_slice(&4u32.to_be_bytes());
+        plain[56..60].copy_from_slice(&1u32.to_be_bytes());
+
+        let encrypted = aes_cbc_encrypt(key, &iv, &plain[SALT_SZ..PAGE_SZ - RESERVE_SZ]);
+
+        let mut page = vec![0u8; PAGE_SZ];
+        page[..SALT_SZ].fill(0x55);
+        page[SALT_SZ..PAGE_SZ - RESERVE_SZ].copy_from_slice(&encrypted);
+        page[PAGE_SZ - RESERVE_SZ..PAGE_SZ - RESERVE_SZ + 16].copy_from_slice(&iv);
+        page
+    }
+
+    #[test]
+    fn full_decrypt_accepts_page_with_correct_key() {
+        let key = [0x11; 32];
+        let root = unique_tmpdir("full-ok");
+        let db_path = root.join("encrypted.db");
+        let out_path = root.join("plain.db");
+        std::fs::write(&db_path, encrypted_first_page(&key)).unwrap();
+
+        full_decrypt(&db_path, &out_path, &key).unwrap();
+
+        let decrypted = std::fs::read(&out_path).unwrap();
+        assert_eq!(&decrypted[..SQLITE_HDR.len()], SQLITE_HDR);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_decrypt_rejects_wrong_key_on_first_page() {
+        let key = [0x11; 32];
+        let wrong_key = [0x22; 32];
+        let root = unique_tmpdir("full-wrong-key");
+        let db_path = root.join("encrypted.db");
+        let out_path = root.join("plain.db");
+        std::fs::write(&db_path, encrypted_first_page(&key)).unwrap();
+
+        let err = full_decrypt(&db_path, &out_path, &wrong_key).unwrap_err();
+        assert!(
+            err.to_string().contains("解密失败：首页魔数不匹配"),
+            "unexpected error: {err:#}"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

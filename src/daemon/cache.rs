@@ -361,14 +361,14 @@ fn hex_to_32bytes(s: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
 
-    /// 64 字符 hex（不需要是真 SQLCipher key — 仅用来证明"是否触发了 full_decrypt"）
+    /// 64 字符 hex，用于构造测试用的最小加密页。
     const FAKE_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
     /// 路径区分约定：
     /// - 完全 hit / WAL 增量 → `decrypted_path` **内容不变**
     /// - 全量解密 → `crypto::full_decrypt` 把 cached file **重写为 PAGE_SZ 倍数**
-    ///   （fake key 解出 4096 字节垃圾，但仍写入 — 不验证内容合法性）
     /// 因此用 cached file 的"size 是否被改"来判断走了哪条路径。
     const ORIGINAL_CACHED_BYTES: &[u8] = b"original cached contents";
 
@@ -381,6 +381,51 @@ mod tests {
         let p = std::env::temp_dir().join(format!("wx-cli-cache-test-{}-{}-{}", tag, pid, nanos));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    fn aes_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Vec<u8> {
+        assert!(!data.is_empty());
+        assert_eq!(data.len() % 16, 0);
+
+        type AesBlock = aes::cipher::Block<aes::Aes256>;
+        let mut blocks: Vec<AesBlock> = data
+            .chunks_exact(16)
+            .map(AesBlock::clone_from_slice)
+            .collect();
+        cbc::Encryptor::<aes::Aes256>::new(key.into(), iv.into()).encrypt_blocks_mut(&mut blocks);
+        blocks.iter().flat_map(|b| b.iter().copied()).collect()
+    }
+
+    fn encrypted_first_page() -> Vec<u8> {
+        let key = hex_to_32bytes(FAKE_KEY_HEX).unwrap();
+        let iv = [0x24; 16];
+        let mut plain = vec![0u8; crate::crypto::PAGE_SZ];
+        plain[..crate::crypto::SQLITE_HDR.len()].copy_from_slice(crate::crypto::SQLITE_HDR);
+        plain[16..18].copy_from_slice(&(crate::crypto::PAGE_SZ as u16).to_be_bytes());
+        plain[18] = 1;
+        plain[19] = 1;
+        plain[20] = 0;
+        plain[21] = 64;
+        plain[22] = 32;
+        plain[23] = 32;
+        plain[28..32].copy_from_slice(&1u32.to_be_bytes());
+        plain[44..48].copy_from_slice(&4u32.to_be_bytes());
+        plain[56..60].copy_from_slice(&1u32.to_be_bytes());
+
+        let encrypted = aes_cbc_encrypt(
+            &key,
+            &iv,
+            &plain[crate::crypto::SALT_SZ..crate::crypto::PAGE_SZ - crate::crypto::RESERVE_SZ],
+        );
+
+        let mut page = vec![0u8; crate::crypto::PAGE_SZ];
+        page[..crate::crypto::SALT_SZ].fill(0xaa);
+        page[crate::crypto::SALT_SZ..crate::crypto::PAGE_SZ - crate::crypto::RESERVE_SZ]
+            .copy_from_slice(&encrypted);
+        page[crate::crypto::PAGE_SZ - crate::crypto::RESERVE_SZ
+            ..crate::crypto::PAGE_SZ - crate::crypto::RESERVE_SZ + 16]
+            .copy_from_slice(&iv);
+        page
     }
 
     /// 准备一份 "DbCache 已经 reuse 了 cached 解密产物" 的初始状态。
@@ -512,17 +557,17 @@ mod tests {
         let (cache, db_path, decrypted_path, _mtime_file, rel_key) =
             setup_seeded_cache("dbchange").await;
 
-        // bump 主 .db 的 mtime（重写一份不同 bytes）
+        // bump 主 .db 的 mtime（重写一份可解密的最小加密页）
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&db_path, b"different fake encrypted bytes").unwrap();
+        std::fs::write(&db_path, encrypted_first_page()).unwrap();
         assert_ne!(
             mtime_nanos(&db_path),
             cache.inner.lock().await.get(&rel_key).unwrap().db_mtime,
             "rewriting db file should bump mtime"
         );
 
-        // 走 full_decrypt 路径 → fake key 不会让 full_decrypt 失败（它不验证内容），
-        // 但会把 cached file 重写为 PAGE_SZ 倍数。原始内容是 24 bytes，重写后应该 ≥ 4096 bytes。
+        // 走 full_decrypt 路径 → cached file 被重写为 PAGE_SZ 倍数。
+        // 原始内容是 24 bytes，重写后应该 ≥ 4096 bytes。
         let p = cache
             .get(&rel_key)
             .await
@@ -594,7 +639,7 @@ mod tests {
         assert_eq!(wal.mode, CacheMode::WalIncremental);
 
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&db_path, b"different bytes").unwrap();
+        std::fs::write(&db_path, encrypted_first_page()).unwrap();
         let full = cache
             .get_with_mode(&rel_key)
             .await

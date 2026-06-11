@@ -15,12 +15,24 @@ use crate::config;
 ///
 /// 当 WX_DAEMON_MODE 环境变量设置时，main() 调用此函数
 pub fn run() {
+    set_secure_umask();
+
     let rt = tokio::runtime::Runtime::new().expect("无法创建 tokio runtime");
     if let Err(e) = rt.block_on(async_run()) {
         eprintln!("[daemon] 启动失败: {}", e);
         std::process::exit(1);
     }
 }
+
+#[cfg(unix)]
+fn set_secure_umask() {
+    unsafe {
+        libc::umask(0o077);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_secure_umask() {}
 
 async fn async_run() -> Result<()> {
     // 确保工作目录存在
