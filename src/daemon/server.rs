@@ -247,6 +247,15 @@ async fn dispatch(
             Ok(v) => Response::ok(v),
             Err(e) => Response::err(e.to_string()),
         },
+        Files {
+            file_type,
+            limit,
+            since,
+            until,
+        } => match query::q_files(db, file_type, limit, since, until).await {
+            Ok(v) => Response::ok(v),
+            Err(e) => Response::err(e.to_string()),
+        },
         Stats { chat, since, until } => {
             match query::q_stats(db, &names_arc, &chat, since, until).await {
                 Ok(v) => Response::ok(v),

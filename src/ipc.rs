@@ -98,6 +98,18 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
     },
+    Files {
+        /// 类型过滤：image / video / file
+        #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+        file_type: Option<String>,
+        /// 限制返回条数；未指定时不限制
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+    },
     /// 朋友圈互动通知（点赞 + 评论）
     SnsNotifications {
         #[serde(default = "default_limit_50")]

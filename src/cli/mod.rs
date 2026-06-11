@@ -7,6 +7,7 @@ pub mod daemon_cmd;
 pub mod export;
 pub mod extract;
 pub mod favorites;
+pub mod files;
 pub mod friend_requests;
 pub mod history;
 mod init;
@@ -245,6 +246,25 @@ enum Commands {
         /// 限制返回/导出条数
         #[arg(short = 'n', long)]
         limit: Option<usize>,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出本地文件/图片/视频索引
+    Files {
+        /// 类型过滤 [image|video|file]
+        #[arg(long = "type", value_name = "TYPE",
+              value_parser = ["image","video","file"])]
+        file_type: Option<String>,
+        /// 限制返回条数
+        #[arg(short = 'n', long)]
+        limit: Option<usize>,
+        /// 起始 modify_time（unix 秒，或 YYYY-MM-DD / YYYY-MM-DD HH:MM）
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束 modify_time（unix 秒，或 YYYY-MM-DD / YYYY-MM-DD HH:MM）
+        #[arg(long)]
+        until: Option<String>,
         /// 输出 JSON（默认 YAML）
         #[arg(long)]
         json: bool,
@@ -495,6 +515,13 @@ fn dispatch(cli: Cli) -> Result<()> {
             limit,
             json,
         } => avatars::cmd_avatars(username, out, limit, json),
+        Commands::Files {
+            file_type,
+            limit,
+            since,
+            until,
+            json,
+        } => files::cmd_files(file_type, limit, since, until, json),
         Commands::SnsNotifications {
             limit,
             since,
