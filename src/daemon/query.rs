@@ -1582,6 +1582,19 @@ fn fmt_content(local_id: i64, local_type: i64, content: &str, is_group: bool) ->
         content
     };
 
+    if base == 42 {
+        return extract_xml_attr(text, "msg", "nickname")
+            .map(|nickname| format!("[名片] {}", nickname))
+            .unwrap_or_else(|| "[名片]".into());
+    }
+
+    if base == 48 {
+        return extract_xml_attr(text, "location", "poiname")
+            .or_else(|| extract_xml_attr(text, "location", "label"))
+            .map(|name| format!("[位置] {}", name))
+            .unwrap_or_else(|| "[位置]".into());
+    }
+
     if base == 49 && text.contains("<appmsg") {
         if let Some(parsed) = parse_appmsg(text) {
             return parsed;
@@ -3794,6 +3807,30 @@ mod tests {
     fn parse_appmsg_formats_transfer_preview() {
         let xml = transfer_xml("t1", "8", "4075.00", "kuen133", "收到转账4075.00元");
         assert_eq!(parse_appmsg(&xml).as_deref(), Some("[转账] ￥4075.00"));
+    }
+
+    #[test]
+    fn fmt_content_formats_contact_card_nickname() {
+        let xml = r#"<msg username="wxid_alice" nickname="Alice" alias="alice"/>"#;
+        assert_eq!(fmt_content(1, 42, xml, false), "[名片] Alice");
+    }
+
+    #[test]
+    fn fmt_content_contact_card_without_nickname_falls_back() {
+        let xml = r#"<msg username="wxid_alice" alias="alice"/>"#;
+        assert_eq!(fmt_content(1, 42, xml, false), "[名片]");
+    }
+
+    #[test]
+    fn fmt_content_formats_location_poiname() {
+        let xml = r#"<msg><location x="31.2304" y="121.4737" poiname="人民广场" label="上海市黄浦区"/></msg>"#;
+        assert_eq!(fmt_content(1, 48, xml, false), "[位置] 人民广场");
+    }
+
+    #[test]
+    fn fmt_content_location_without_name_falls_back() {
+        let xml = r#"<msg><location x="31.2304" y="121.4737"/></msg>"#;
+        assert_eq!(fmt_content(1, 48, xml, false), "[位置]");
     }
 
     #[test]
