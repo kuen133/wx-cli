@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
 use crate::config;
@@ -69,6 +69,7 @@ pub struct DbCache {
     mtime_file: PathBuf,
     all_keys: HashMap<String, String>, // rel_key -> enc_key(hex)
     inner: Arc<Mutex<HashMap<String, CacheEntry>>>,
+    locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl DbCache {
@@ -91,6 +92,7 @@ impl DbCache {
             mtime_file,
             all_keys,
             inner: Arc::new(Mutex::new(HashMap::new())),
+            locks: StdMutex::new(HashMap::new()),
         };
 
         cache.load_persistent().await;
@@ -111,6 +113,14 @@ impl DbCache {
     fn cache_file_path(&self, rel_key: &str) -> PathBuf {
         let hash = format!("{:x}", md5::compute(rel_key.as_bytes()));
         self.cache_dir.join(format!("{}.db", hash))
+    }
+
+    fn lock_for(&self, rel_key: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|err| err.into_inner());
+        locks
+            .entry(rel_key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// 从持久化文件加载 mtime 记录，复用未过期的解密文件
@@ -237,7 +247,36 @@ impl DbCache {
         let enc_key_bytes =
             hex_to_32bytes(&enc_key_hex).with_context(|| format!("密钥格式错误: {}", rel_key))?;
 
-        // Path 1 / Path 2：主 .db mtime 未变且 cached 产物仍在
+        // Path 1：主 .db / WAL mtime 都未变且 cached 产物仍在，直接快速返回。
+        if let Some(entry) = cached.as_ref() {
+            if entry.db_mtime == db_mt && entry.decrypted_path.exists() {
+                if entry.wal_mtime == wal_mt {
+                    return Ok(Some(CacheResolve {
+                        path: entry.decrypted_path.clone(),
+                        mode: CacheMode::CacheHit,
+                    }));
+                }
+            }
+        }
+
+        let key_lock = self.lock_for(rel_key);
+        let _key_guard = key_lock.lock().await;
+
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let db_mt = mtime_nanos(&db_path);
+        let wal_mt = if wal_path.exists() {
+            mtime_nanos(&wal_path)
+        } else {
+            0
+        };
+        let cached = {
+            let inner = self.inner.lock().await;
+            inner.get(rel_key).cloned()
+        };
+
+        // Path 1 / Path 2：拿到 per-key 锁后复查，避免等待期间已由另一请求完成。
         if let Some(entry) = cached.as_ref() {
             if entry.db_mtime == db_mt && entry.decrypted_path.exists() {
                 if entry.wal_mtime == wal_mt {
@@ -581,6 +620,87 @@ mod tests {
             "expected full_decrypt to rewrite cached file to PAGE_SZ multiple, got size={}",
             new_size,
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_key_gets_share_one_full_decrypt() {
+        let root = unique_tmpdir("concurrent-same-key");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let rel_key = "message_0.db".to_string();
+        let db_path = db_dir.join(&rel_key);
+        std::fs::write(&db_path, encrypted_first_page()).unwrap();
+
+        let mut all_keys = HashMap::new();
+        all_keys.insert(rel_key.clone(), FAKE_KEY_HEX.to_string());
+        let cache = DbCache::with_dirs(db_dir, cache_dir, root.join("_mtimes.json"), all_keys)
+            .await
+            .unwrap();
+
+        let (r1, r2, r3, r4) = tokio::join!(
+            cache.get_with_mode(&rel_key),
+            cache.get_with_mode(&rel_key),
+            cache.get_with_mode(&rel_key),
+            cache.get_with_mode(&rel_key),
+        );
+        let resolves = vec![
+            r1.unwrap().expect("first concurrent get should resolve"),
+            r2.unwrap().expect("second concurrent get should resolve"),
+            r3.unwrap().expect("third concurrent get should resolve"),
+            r4.unwrap().expect("fourth concurrent get should resolve"),
+        ];
+
+        let first_path = resolves[0].path.clone();
+        assert!(resolves.iter().all(|r| r.path == first_path));
+        assert!(first_path.exists());
+
+        let full_count = resolves
+            .iter()
+            .filter(|r| r.mode == CacheMode::FullDecrypt)
+            .count();
+        assert_eq!(
+            full_count, 1,
+            "same rel_key concurrent miss should perform one full decrypt"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_key_gets_return_same_path() {
+        let root = unique_tmpdir("concurrent-get-same-key");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let rel_key = "message_0.db".to_string();
+        let db_path = db_dir.join(&rel_key);
+        std::fs::write(&db_path, encrypted_first_page()).unwrap();
+
+        let mut all_keys = HashMap::new();
+        all_keys.insert(rel_key.clone(), FAKE_KEY_HEX.to_string());
+        let cache = DbCache::with_dirs(db_dir, cache_dir, root.join("_mtimes.json"), all_keys)
+            .await
+            .unwrap();
+
+        let (r1, r2, r3, r4) = tokio::join!(
+            cache.get(&rel_key),
+            cache.get(&rel_key),
+            cache.get(&rel_key),
+            cache.get(&rel_key),
+        );
+        let paths = vec![
+            r1.unwrap().expect("first concurrent get should resolve"),
+            r2.unwrap().expect("second concurrent get should resolve"),
+            r3.unwrap().expect("third concurrent get should resolve"),
+            r4.unwrap().expect("fourth concurrent get should resolve"),
+        ];
+
+        let first_path = paths[0].clone();
+        assert!(paths.iter().all(|p| p == &first_path));
+        assert!(first_path.exists());
     }
 
     #[tokio::test]

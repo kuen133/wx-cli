@@ -4,8 +4,10 @@ use aes::Aes256;
 use anyhow::{bail, Result};
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use cbc::Decryptor;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 type Block = aes::cipher::Block<Aes256>;
 
@@ -80,28 +82,61 @@ pub fn full_decrypt(db_path: &Path, out_path: &Path, enc_key: &[u8; 32]) -> Resu
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut input = std::fs::File::open(db_path)?;
-    let file_size = input.metadata()?.len() as usize;
-    if file_size == 0 {
-        bail!("数据库文件为空: {}", db_path.display());
-    }
-
-    let mut output = std::fs::File::create(out_path)?;
-    let total_pages = (file_size + PAGE_SZ - 1) / PAGE_SZ;
-    let mut page_buf = vec![0u8; PAGE_SZ];
-
-    for pgno in 1..=total_pages {
-        let page_start = (pgno - 1) * PAGE_SZ;
-        let bytes_remaining = file_size.saturating_sub(page_start);
-        read_page(&mut input, &mut page_buf, bytes_remaining)?;
-        let dec = decrypt_page(enc_key, &page_buf, pgno as u32)?;
-        if pgno == 1 {
-            validate_first_decrypted_page(&dec)?;
+    let tmp_path = temp_decrypt_path(out_path)?;
+    let result = (|| -> Result<()> {
+        let mut input = std::fs::File::open(db_path)?;
+        let file_size = input.metadata()?.len() as usize;
+        if file_size == 0 {
+            bail!("数据库文件为空: {}", db_path.display());
         }
-        output.write_all(&dec)?;
-    }
 
-    Ok(())
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        let total_pages = (file_size + PAGE_SZ - 1) / PAGE_SZ;
+        let mut page_buf = vec![0u8; PAGE_SZ];
+
+        for pgno in 1..=total_pages {
+            let page_start = (pgno - 1) * PAGE_SZ;
+            let bytes_remaining = file_size.saturating_sub(page_start);
+            read_page(&mut input, &mut page_buf, bytes_remaining)?;
+            let dec = decrypt_page(enc_key, &page_buf, pgno as u32)?;
+            if pgno == 1 {
+                validate_first_decrypted_page(&dec)?;
+            }
+            output.write_all(&dec)?;
+        }
+
+        output.flush()?;
+        drop(output);
+        std::fs::rename(&tmp_path, out_path)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+fn temp_decrypt_path(out_path: &Path) -> Result<std::path::PathBuf> {
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let filename = out_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("输出路径缺少文件名: {}", out_path.display()))?;
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut tmp_name = OsString::from(".");
+    tmp_name.push(filename);
+    tmp_name.push(format!(".tmp.{pid}.{nanos}.{counter}"));
+    Ok(out_path.with_file_name(tmp_name))
 }
 
 fn validate_first_decrypted_page(page: &[u8]) -> Result<()> {
@@ -260,6 +295,45 @@ mod tests {
             err.to_string().contains("解密失败：首页魔数不匹配"),
             "unexpected error: {err:#}"
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_decrypt_preserves_existing_output_when_validation_fails() {
+        let key = [0x11; 32];
+        let wrong_key = [0x22; 32];
+        let root = unique_tmpdir("full-preserve-existing");
+        let db_path = root.join("encrypted.db");
+        let out_path = root.join("plain.db");
+        let old_output = b"complete previous decrypted database";
+        std::fs::write(&db_path, encrypted_first_page(&key)).unwrap();
+        std::fs::write(&out_path, old_output).unwrap();
+
+        let err = full_decrypt(&db_path, &out_path, &wrong_key).unwrap_err();
+        assert!(
+            err.to_string().contains("解密失败：首页魔数不匹配"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(std::fs::read(&out_path).unwrap(), old_output);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_decrypt_atomically_replaces_existing_output_on_success() {
+        let key = [0x11; 32];
+        let root = unique_tmpdir("full-replace-existing");
+        let db_path = root.join("encrypted.db");
+        let out_path = root.join("plain.db");
+        std::fs::write(&db_path, encrypted_first_page(&key)).unwrap();
+        std::fs::write(&out_path, b"previous decrypted database").unwrap();
+
+        full_decrypt(&db_path, &out_path, &key).unwrap();
+
+        let decrypted = std::fs::read(&out_path).unwrap();
+        assert_eq!(&decrypted[..SQLITE_HDR.len()], SQLITE_HDR);
+        assert_eq!(decrypted.len(), PAGE_SZ);
 
         std::fs::remove_dir_all(root).unwrap();
     }
