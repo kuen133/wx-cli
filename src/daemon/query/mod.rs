@@ -18,6 +18,7 @@ mod attachment;
 mod biz;
 mod content;
 mod favorites;
+mod freshness;
 mod image_cache;
 mod members;
 mod message;
@@ -48,12 +49,16 @@ pub use transfer::q_transfers;
 use content::{decompress_or_str, fmt_content, fmt_time, get_content_bytes, strip_group_prefix};
 #[cfg(test)]
 use content::{parse_appmsg, parse_sysmsg};
+use freshness::{
+    attach_meta, build_query_meta, build_query_meta_parts, latest_from_sourced_messages,
+    locate_result_shards, session_last_timestamp, single_resolved_chat,
+};
 use image_cache::existing_image_paths;
 #[cfg(test)]
 use image_cache::{extract_embedded_image_bytes, image_cache_candidates};
 #[cfg(test)]
 use message::query_messages;
-use message::{ensure_create_time_index, find_msg_tables};
+use message::{ensure_create_time_index, find_msg_table_infos, find_msg_tables};
 use names::resolve_username;
 #[cfg(test)]
 use search::search_in_table;

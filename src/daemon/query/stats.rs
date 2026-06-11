@@ -13,7 +13,7 @@ pub async fn q_stats(
     let chat_type = chat_type_of(&username, names);
     let is_group = chat_type == "group";
 
-    let tables = find_msg_tables(db, names, &username).await?;
+    let tables = find_msg_table_infos(db, names, &username).await?;
     if tables.is_empty() {
         anyhow::bail!("找不到 {} 的消息记录", display);
     }
@@ -23,15 +23,24 @@ pub async fn q_stats(
     let mut type_counts: HashMap<String, i64> = HashMap::new();
     let mut sender_counts: HashMap<String, i64> = HashMap::new();
     let mut hour_counts = [0i64; 24];
+    let mut shards_hit = 0usize;
+    let mut chat_latest: Option<(i64, String)> = None;
 
-    for (db_path, table_name) in &tables {
-        let path = db_path.clone();
-        let tname = table_name.clone();
+    for table in &tables {
+        let path = table.path.clone();
+        let tname = table.table_name.clone();
+        let rel_key = table.rel_key.clone();
         let uname = username.clone();
         let is_group2 = is_group;
 
         // 用 SQL GROUP BY 在数据库侧聚合，避免把全量消息内容加载进内存
-        let result: (i64, HashMap<String, i64>, HashMap<String, i64>, [i64; 24]) =
+        let result: (
+            i64,
+            HashMap<String, i64>,
+            HashMap<String, i64>,
+            [i64; 24],
+            Option<i64>,
+        ) =
             tokio::task::spawn_blocking(move || {
                 let conn = Connection::open(&path)?;
                 ensure_create_time_index(&conn, &tname);
@@ -61,6 +70,12 @@ pub async fn q_stats(
                     params_ref.as_slice(),
                     |row| row.get(0),
                 ).unwrap_or(0);
+
+                let latest_ts: Option<i64> = conn.query_row(
+                    &format!("SELECT MAX(create_time) FROM [{}] {}", tname, where_clause),
+                    params_ref.as_slice(),
+                    |row| row.get(0),
+                ).ok().flatten();
 
                 // 2. 类型分布：SQL GROUP BY，不加载消息内容
                 let type_sql = format!(
@@ -124,10 +139,18 @@ pub async fn q_stats(
                     }
                 }
 
-                Ok::<_, anyhow::Error>((count, type_c, sender_c, hour_c))
+                Ok::<_, anyhow::Error>((count, type_c, sender_c, hour_c, latest_ts))
             }).await??;
 
-        let (count, type_c, sender_c, hour_c) = result;
+        let (count, type_c, sender_c, hour_c, latest_ts) = result;
+        if count > 0 {
+            shards_hit += 1;
+        }
+        if let Some(ts) = latest_ts {
+            if chat_latest.as_ref().map_or(true, |(cur, _)| ts > *cur) {
+                chat_latest = Some((ts, rel_key));
+            }
+        }
         total += count;
         for (k, v) in type_c {
             *type_counts.entry(k).or_insert(0) += v;
@@ -169,14 +192,28 @@ pub async fn q_stats(
         .map(|(h, c)| json!({ "hour": h, "count": c }))
         .collect();
 
-    Ok(json!({
-        "chat": display,
-        "username": username,
-        "is_group": is_group,
-        "chat_type": chat_type,
-        "total": total,
-        "by_type": by_type,
-        "top_senders": top_senders,
-        "by_hour": by_hour,
-    }))
+    let session_last = session_last_timestamp(db, &username).await;
+    let meta = build_query_meta(
+        db,
+        names,
+        chat_latest,
+        session_last,
+        names.msg_db_keys.len(),
+        shards_hit,
+        since.is_some() || until.is_some(),
+    );
+
+    Ok(attach_meta(
+        json!({
+            "chat": display,
+            "username": username,
+            "is_group": is_group,
+            "chat_type": chat_type,
+            "total": total,
+            "by_type": by_type,
+            "top_senders": top_senders,
+            "by_hour": by_hour,
+        }),
+        meta,
+    ))
 }

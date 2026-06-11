@@ -10,8 +10,6 @@
 //!    `message/message_*.db` 文件，diff 出 daemon 未持有 enc_key 的"未知分片"列表。
 //! 3. 集中 `MetaStatus` 的判定规则，避免 8 个 q_* 各自判，规则漂移。
 
-#![allow(dead_code)]
-
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -80,6 +78,36 @@ pub enum MetaStatus {
 /// 24h 的取值是故意保守的：活跃群聊/私聊很少会整整一天没有新消息，
 /// 超过这个窗口就值得显式提醒 agent 不要把结果当成“当前最新状态”。
 pub const STALE_THRESHOLD_SECS: i64 = 24 * 3600;
+
+pub fn build_meta(
+    db_dir: &Path,
+    known_msg_db_keys: &[String],
+    chat_latest_timestamp: Option<i64>,
+    chat_latest_db: Option<String>,
+    session_last_timestamp: Option<i64>,
+    shards_scanned: usize,
+    shards_hit: usize,
+    windowed: bool,
+) -> Meta {
+    let unknown_shards = discover_unknown_shards(db_dir, known_msg_db_keys);
+    let status = derive_status(
+        chat_latest_timestamp,
+        session_last_timestamp,
+        &unknown_shards,
+        windowed,
+    );
+
+    Meta {
+        chat_latest_timestamp,
+        chat_latest_db,
+        session_last_timestamp,
+        shards_scanned,
+        shards_hit,
+        unknown_shards,
+        status,
+        ..Default::default()
+    }
+}
 
 /// 统一 freshness status 的优先级：
 /// 1. `unknown_shards` 非空：daemon 整体视图已经过期，优先返回 `PossiblyStaleUnknownShards`
@@ -212,6 +240,32 @@ mod tests {
     fn discover_unknown_shards_returns_empty_when_message_dir_missing() {
         let dir = tempdir();
         assert!(discover_unknown_shards(&dir, &[]).is_empty());
+    }
+
+    #[test]
+    fn build_meta_reports_unknown_shards_as_possibly_stale() {
+        let dir = tempdir();
+        let msg_dir = dir.join("message");
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(msg_dir.join("message_0.db"), b"").unwrap();
+        std::fs::write(msg_dir.join("message_1.db"), b"").unwrap();
+
+        let known = vec!["message/message_0.db".to_string()];
+        let meta = build_meta(
+            &dir,
+            &known,
+            Some(123),
+            Some("message/message_0.db".to_string()),
+            Some(123),
+            1,
+            1,
+            false,
+        );
+
+        assert_eq!(meta.status, MetaStatus::PossiblyStaleUnknownShards);
+        assert_eq!(meta.unknown_shards, vec!["message/message_1.db"]);
+        assert_eq!(meta.chat_latest_timestamp, Some(123));
+        assert_eq!(meta.chat_latest_db.as_deref(), Some("message/message_0.db"));
     }
 
     #[test]

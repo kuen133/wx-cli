@@ -5,6 +5,13 @@ pub(crate) fn msg_table_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^Msg_[0-9a-f]{32}$").unwrap())
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct MsgTable {
+    pub rel_key: String,
+    pub path: std::path::PathBuf,
+    pub table_name: String,
+}
+
 fn sqlite_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -49,18 +56,18 @@ pub async fn q_history(
     let chat_type = chat_type_of(&username, names);
     let is_group = chat_type == "group";
 
-    let tables = find_msg_tables(db, names, &username).await?;
+    let tables = find_msg_table_infos(db, names, &username).await?;
     if tables.is_empty() {
         anyhow::bail!("找不到 {} 的消息记录", display);
     }
 
-    let mut all_msgs: Vec<Value> = Vec::new();
-    let account_root = config::load_config()
-        .ok()
-        .and_then(|cfg| cfg.db_dir.parent().map(Path::to_path_buf));
-    for (db_path, table_name) in &tables {
-        let path = db_path.clone();
-        let tname = table_name.clone();
+    let mut all_msgs: Vec<(String, Value)> = Vec::new();
+    let mut shards_hit = 0usize;
+    let account_root = db.db_dir().parent().map(Path::to_path_buf);
+    for table in &tables {
+        let path = table.path.clone();
+        let tname = table.table_name.clone();
+        let rel_key = table.rel_key.clone();
         let uname = username.clone();
         let is_group2 = is_group;
         let names_map = names.map.clone();
@@ -89,24 +96,42 @@ pub async fn q_history(
         })
         .await??;
 
-        all_msgs.extend(msgs);
+        if !msgs.is_empty() {
+            shards_hit += 1;
+        }
+        all_msgs.extend(msgs.into_iter().map(|msg| (rel_key.clone(), msg)));
     }
 
-    all_msgs.sort_by_key(|m| std::cmp::Reverse(m["timestamp"].as_i64().unwrap_or(0)));
-    let paged: Vec<Value> = all_msgs.into_iter().skip(offset).take(limit).collect();
-    let mut paged = paged;
-    paged.sort_by_key(|m| m["timestamp"].as_i64().unwrap_or(0));
+    all_msgs.sort_by_key(|(_, m)| std::cmp::Reverse(m["timestamp"].as_i64().unwrap_or(0)));
+    let mut paged: Vec<(String, Value)> = all_msgs.into_iter().skip(offset).take(limit).collect();
+    let chat_latest = latest_from_sourced_messages(&paged);
+    paged.sort_by_key(|(_, m)| m["timestamp"].as_i64().unwrap_or(0));
+    let mut paged: Vec<Value> = paged.into_iter().map(|(_, msg)| msg).collect();
 
     voice_asr::enrich_history_messages(db, &username, &mut paged, with_asr).await;
 
-    Ok(json!({
-        "chat": display,
-        "username": username,
-        "is_group": is_group,
-        "chat_type": chat_type,
-        "count": paged.len(),
-        "messages": paged,
-    }))
+    let session_last = session_last_timestamp(db, &username).await;
+    let meta = build_query_meta(
+        db,
+        names,
+        chat_latest,
+        session_last,
+        names.msg_db_keys.len(),
+        shards_hit,
+        since.is_some() || until.is_some() || offset > 0,
+    );
+
+    Ok(attach_meta(
+        json!({
+            "chat": display,
+            "username": username,
+            "is_group": is_group,
+            "chat_type": chat_type,
+            "count": paged.len(),
+            "messages": paged,
+        }),
+        meta,
+    ))
 }
 
 pub(super) async fn find_msg_tables(
@@ -114,12 +139,24 @@ pub(super) async fn find_msg_tables(
     names: &Names,
     username: &str,
 ) -> Result<Vec<(std::path::PathBuf, String)>> {
+    Ok(find_msg_table_infos(db, names, username)
+        .await?
+        .into_iter()
+        .map(|info| (info.path, info.table_name))
+        .collect())
+}
+
+pub(super) async fn find_msg_table_infos(
+    db: &DbCache,
+    names: &Names,
+    username: &str,
+) -> Result<Vec<MsgTable>> {
     let table_name = format!("Msg_{:x}", md5::compute(username.as_bytes()));
     if !msg_table_re().is_match(&table_name) {
         return Ok(Vec::new());
     }
 
-    let mut results: Vec<(i64, std::path::PathBuf, String)> = Vec::new();
+    let mut results: Vec<(i64, MsgTable)> = Vec::new();
     for rel_key in &names.msg_db_keys {
         let path = match db.get(rel_key).await? {
             Some(p) => p,
@@ -154,13 +191,20 @@ pub(super) async fn find_msg_tables(
         .await??;
 
         if let Some(ts) = max_ts {
-            results.push((ts, path.clone(), table_name.clone()));
+            results.push((
+                ts,
+                MsgTable {
+                    rel_key: rel_key.clone(),
+                    path: path.clone(),
+                    table_name: table_name.clone(),
+                },
+            ));
         }
     }
 
     // 按最大时间戳降序排列（最新的优先）
-    results.sort_by_key(|(ts, _, _)| std::cmp::Reverse(*ts));
-    Ok(results.into_iter().map(|(_, p, t)| (p, t)).collect())
+    results.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
+    Ok(results.into_iter().map(|(_, info)| info).collect())
 }
 
 pub(super) fn query_messages(
@@ -328,17 +372,22 @@ pub async fn q_new_messages(
         .collect();
 
     if changed.is_empty() {
-        return Ok(json!({
-            "count": 0,
-            "messages": [],
-            "new_state": session_ts_map,
-        }));
+        let meta = build_query_meta(db, names, None, None, 0, 0, false);
+        return Ok(attach_meta(
+            json!({
+                "count": 0,
+                "messages": [],
+                "new_state": session_ts_map,
+            }),
+            meta,
+        ));
     }
 
     // 4. 只查询有新消息的会话的消息表
     // per_table_limit 取 limit*5 防止单表截断，最终由全局 truncate 收尾
     let per_table_limit = limit.saturating_mul(5).max(200);
-    let mut all_msgs: Vec<Value> = Vec::new();
+    let mut all_msgs: Vec<(String, Value)> = Vec::new();
+    let mut hit_shards = std::collections::HashSet::new();
 
     for (uname, _) in &changed {
         let since_ts = state
@@ -346,7 +395,7 @@ pub async fn q_new_messages(
             .and_then(|m| m.get(uname))
             .copied()
             .unwrap_or(fallback_ts);
-        let tables = find_msg_tables(db, names, uname).await?;
+        let tables = find_msg_table_infos(db, names, uname).await?;
         if tables.is_empty() {
             continue;
         }
@@ -355,9 +404,10 @@ pub async fn q_new_messages(
         let chat_type = chat_type_of(uname, names);
         let is_group = chat_type == "group";
 
-        for (db_path, table_name) in &tables {
-            let path = db_path.clone();
-            let tname = table_name.clone();
+        for table in &tables {
+            let path = table.path.clone();
+            let tname = table.table_name.clone();
+            let rel_key = table.rel_key.clone();
             let uname2 = uname.clone();
             let display2 = display.clone();
             let names_map = names.map.clone();
@@ -434,12 +484,16 @@ pub async fn q_new_messages(
                 }
             };
 
-            all_msgs.extend(msgs);
+            if !msgs.is_empty() {
+                hit_shards.insert(rel_key.clone());
+            }
+            all_msgs.extend(msgs.into_iter().map(|msg| (rel_key.clone(), msg)));
         }
     }
 
-    all_msgs.sort_by_key(|m| m["timestamp"].as_i64().unwrap_or(0));
+    all_msgs.sort_by_key(|(_, m)| m["timestamp"].as_i64().unwrap_or(0));
     all_msgs.truncate(limit);
+    let chat_latest = latest_from_sourced_messages(&all_msgs);
 
     // 5. 重建 new_state，防止全局 limit 截断导致消息永久丢失：
     //    - 未变化的会话：沿用 session.db 的 last_timestamp
@@ -456,7 +510,7 @@ pub async fn q_new_messages(
         new_state.insert(uname.clone(), old_ts);
     }
     // 再根据实际返回的消息向前推进
-    for m in &all_msgs {
+    for (_, m) in &all_msgs {
         if let (Some(uname), Some(ts)) = (m["username"].as_str(), m["timestamp"].as_i64()) {
             let e = new_state.entry(uname.to_string()).or_insert(0);
             if ts > *e {
@@ -465,9 +519,23 @@ pub async fn q_new_messages(
         }
     }
 
-    Ok(json!({
-        "count": all_msgs.len(),
-        "messages": all_msgs,
-        "new_state": new_state,
-    }))
+    let messages: Vec<Value> = all_msgs.into_iter().map(|(_, msg)| msg).collect();
+    let meta = build_query_meta(
+        db,
+        names,
+        chat_latest,
+        None,
+        names.msg_db_keys.len(),
+        hit_shards.len(),
+        false,
+    );
+
+    Ok(attach_meta(
+        json!({
+            "count": messages.len(),
+            "messages": messages,
+            "new_state": new_state,
+        }),
+        meta,
+    ))
 }
