@@ -19,6 +19,24 @@ fn msg_table_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^Msg_[0-9a-f]{32}$").unwrap())
 }
 
+fn sqlite_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn ensure_create_time_index(conn: &Connection, table: &str) {
+    // 这里只处理 query 层打开的解密缓存副本，不碰微信源库 db_storage。
+    // full_decrypt 重写缓存文件后索引会丢失，下次查询由 IF NOT EXISTS 一次性重建；
+    // WAL 增量是原地更新缓存文件，已建索引会保留。建索引失败按 best-effort 忽略，
+    // 避免只读缓存、缺表或异常 schema 影响原本可执行的查询。
+    let index = format!("idx_{}_ct", table);
+    let sql = format!(
+        "CREATE INDEX IF NOT EXISTS {} ON {}(create_time)",
+        sqlite_identifier(&index),
+        sqlite_identifier(table)
+    );
+    let _ = conn.execute(&sql, []);
+}
+
 /// 判定会话类型。返回值固定为 `group` / `official_account` / `folded` / `private` 之一。
 ///
 /// 判据次序：
@@ -752,6 +770,7 @@ async fn find_msg_tables(
             if table_exists.is_none() {
                 return Ok::<_, anyhow::Error>(None);
             }
+            ensure_create_time_index(&conn, &tname);
             let ts: Option<i64> = conn
                 .query_row(
                     &format!("SELECT MAX(create_time) FROM [{}]", tname),
@@ -788,6 +807,7 @@ fn query_messages(
     account_root: Option<&Path>,
 ) -> Result<Vec<Value>> {
     let conn = Connection::open(db_path)?;
+    ensure_create_time_index(&conn, table);
     let id2u = load_id2u(&conn);
 
     let mut clauses = Vec::new();
@@ -1015,6 +1035,7 @@ fn query_transfer_messages(
     until: Option<i64>,
 ) -> Result<Vec<TransferMessage>> {
     let conn = Connection::open(db_path)?;
+    ensure_create_time_index(&conn, table);
     let id2u = load_id2u(&conn);
 
     let mut clauses = vec!["(local_type & 4294967295) = 49".to_string()];
@@ -1345,6 +1366,7 @@ fn search_in_table(
     msg_type: Option<i64>,
     limit: usize,
 ) -> Result<Vec<Value>> {
+    ensure_create_time_index(conn, table);
     let id2u = load_id2u(conn);
     // 转义 LIKE 通配符，使用 '\' 作为 ESCAPE 字符
     let escaped_kw = keyword
@@ -2177,6 +2199,7 @@ pub async fn q_new_messages(
 
             let msgs: Vec<Value> = match tokio::task::spawn_blocking(move || {
                 let conn = Connection::open(&path)?;
+                ensure_create_time_index(&conn, &tname);
                 let id2u = load_id2u(&conn);
 
                 let sql = format!(
@@ -2421,6 +2444,7 @@ pub async fn q_stats(
         let result: (i64, HashMap<String, i64>, HashMap<String, i64>, [i64; 24]) =
             tokio::task::spawn_blocking(move || {
                 let conn = Connection::open(&path)?;
+                ensure_create_time_index(&conn, &tname);
                 let id2u = load_id2u(&conn);
 
                 let mut clauses = Vec::new();
@@ -3380,6 +3404,7 @@ pub async fn q_biz_articles(
                 }
             }
             let username = md5_to_uname.get(hash).cloned().unwrap_or_default();
+            ensure_create_time_index(&conn, tname);
 
             let mut clauses: Vec<String> = vec!["(local_type & 4294967295) = 49".to_string()];
             let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -3500,6 +3525,7 @@ pub async fn q_attachments(
 
         let rows: Vec<(i64, i64, i64, String, String)> = tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&path)?;
+            ensure_create_time_index(&conn, &tname);
             let id2u = load_id2u(&conn);
             let placeholders = lo32_types2
                 .iter()
@@ -3784,6 +3810,47 @@ mod tests {
                 amount_cents: Some(amount_cents),
             },
         }
+    }
+
+    #[test]
+    fn ensure_create_time_index_creates_msg_table_index_best_effort() {
+        let path = temp_db_path("create-time-index");
+        let conn = Connection::open(&path).expect("open temp db");
+        let table = "Msg_1234567890abcdef1234567890abcdef";
+        conn.execute(
+            &format!(
+                "CREATE TABLE {table} (
+                    local_id INTEGER PRIMARY KEY,
+                    create_time INTEGER,
+                    message_content TEXT
+                )"
+            ),
+            [],
+        )
+        .expect("create message table");
+        conn.execute(
+            &format!(
+                "INSERT INTO {table} (local_id, create_time, message_content)
+                 VALUES (1, 300, 'newer'), (2, 100, 'older')"
+            ),
+            [],
+        )
+        .expect("insert rows");
+
+        ensure_create_time_index(&conn, table);
+
+        let index_name = format!("idx_{table}_ct");
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [&index_name],
+                |row| row.get(0),
+            )
+            .expect("query sqlite_master");
+        assert_eq!(exists, 1);
+
+        ensure_create_time_index(&conn, "Msg_does_not_exist_000000000000000000");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
