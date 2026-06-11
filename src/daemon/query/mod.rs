@@ -15,6 +15,7 @@ use super::search_index;
 use super::voice_asr;
 
 mod attachment;
+mod avatars;
 mod biz;
 mod content;
 mod favorites;
@@ -32,6 +33,7 @@ mod transfer;
 mod xml;
 
 pub use attachment::{q_attachments, q_extract};
+pub use avatars::q_avatars;
 pub use biz::q_biz_articles;
 pub(crate) use content::{decompress_message, fmt_type};
 pub use favorites::q_favorites;

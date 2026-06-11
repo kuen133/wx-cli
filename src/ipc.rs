@@ -87,6 +87,17 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         query: Option<String>,
     },
+    Avatars {
+        /// 精确匹配联系人/群 username
+        #[serde(skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        /// 导出目录；未指定时只列元数据
+        #[serde(skip_serializing_if = "Option::is_none")]
+        out: Option<String>,
+        /// 限制返回/导出条数；未指定时不限制
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
     /// 朋友圈互动通知（点赞 + 评论）
     SnsNotifications {
         #[serde(default = "default_limit_50")]

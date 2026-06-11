@@ -239,6 +239,14 @@ async fn dispatch(
             Ok(v) => Response::ok(v),
             Err(e) => Response::err(e.to_string()),
         },
+        Avatars {
+            username,
+            out,
+            limit,
+        } => match query::q_avatars(db, username, out, limit).await {
+            Ok(v) => Response::ok(v),
+            Err(e) => Response::err(e.to_string()),
+        },
         Stats { chat, since, until } => {
             match query::q_stats(db, &names_arc, &chat, since, until).await {
                 Ok(v) => Response::ok(v),

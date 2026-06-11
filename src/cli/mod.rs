@@ -1,5 +1,6 @@
 pub mod asr_backfill;
 pub mod attachments;
+pub mod avatars;
 pub mod biz_articles;
 pub mod contacts;
 pub mod daemon_cmd;
@@ -229,6 +230,21 @@ enum Commands {
         /// 内容关键词搜索
         #[arg(short = 'q', long)]
         query: Option<String>,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出或导出微信头像
+    Avatars {
+        /// 精确匹配联系人/群 username
+        #[arg(long)]
+        username: Option<String>,
+        /// 导出目录；未指定时只列头像元数据
+        #[arg(long)]
+        out: Option<String>,
+        /// 限制返回/导出条数
+        #[arg(short = 'n', long)]
+        limit: Option<usize>,
         /// 输出 JSON（默认 YAML）
         #[arg(long)]
         json: bool,
@@ -473,6 +489,12 @@ fn dispatch(cli: Cli) -> Result<()> {
             query,
             json,
         } => favorites::cmd_favorites(limit, fav_type, query, json),
+        Commands::Avatars {
+            username,
+            out,
+            limit,
+            json,
+        } => avatars::cmd_avatars(username, out, limit, json),
         Commands::SnsNotifications {
             limit,
             since,
