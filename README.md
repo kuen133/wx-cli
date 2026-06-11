@@ -8,7 +8,7 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org)
 
-会话 · 聊天记录 · 搜索 · 联系人 · 群成员 · 收藏 · 统计 · 导出 · **朋友圈**
+会话 · 聊天记录 · 搜索 · 联系人 · 群成员 · 收藏 · 统计 · 附件 · 导出 · **朋友圈**
 
 </div>
 
@@ -16,7 +16,7 @@
 
 ## 🍴 这是一个 fork
 
-Forked from **[jackwener/wx-cli](https://github.com/jackwener/wx-cli)** @ `v0.1.9` (commit `697d3fc`)，遵循 upstream 的 Apache-2.0 协议。感谢原作者的工作 🙏
+Forked from **[jackwener/wx-cli](https://github.com/jackwener/wx-cli)**，当前已同步 upstream `v0.3.0` 及其后续稳定发送者身份更新，遵循 upstream 的 Apache-2.0 协议。感谢原作者的工作 🙏
 
 **本 fork 相对 upstream 的改动：**
 
@@ -25,10 +25,12 @@ Forked from **[jackwener/wx-cli](https://github.com/jackwener/wx-cli)** @ `v0.1.
 | 🐛 fix | WeChat 4.1.x 多账号场景下，upstream 检测错账号目录 → 修成按 `db_storage/session/` 内文件的最新 mtime 排 |
 | 🐛 fix | upstream 把 `biz_message_*.db` 过滤掉了，导致 `wx history "公众号名"` 报"找不到消息记录" → 加回来 |
 | 🐛 fix | 链接标题输出被 `<![CDATA[...]]>` 包着 → 剥掉 |
-| ✨ feat | `wx moments` 查朋友圈（文字/媒体/过滤） |
-| ✨ feat | `wx moments-inbox` 别人评论/点赞我的通知 |
+| ✨ feat | `wx sns-feed` / `wx sns-search` / `wx sns-notifications` 朋友圈时间线 / 搜索 / 通知 |
+| ✨ feat | `wx biz-articles` 查询公众号文章推送 |
+| ✨ feat | `wx attachments` / `wx extract` 枚举并提取图片附件 |
 | ✨ feat | `wx friend-requests` 好友申请历史（申请话术、来源、方向） |
 | ⚡ perf | `wx search` 25-40× 提速：自建 trigram FTS5 索引（upstream 用 LIKE 全表扫；微信的 `message_fts.db` 用私有 `MMFtsTokenizer`，标准 SQLite 打不开） |
+| ⚡ perf | 继承 upstream WAL 增量缓存：主库不变、仅 WAL 更新时避免整库重新解密 |
 
 看详细变更：[commit log](../../commits) · [原始 upstream](https://github.com/jackwener/wx-cli)
 
@@ -175,9 +177,17 @@ wx transfers "张三" --summary-only             # 只看汇总表
 wx transfers "张三" --since 2026-01-01          # 自定义时间范围
 wx search "关键词"                               # 全库搜索
 wx search "会议" --in "工作群" --since 2026-01-01
+wx biz-articles                                 # 公众号文章推送
+wx biz-articles --account "宝玉" --unread       # 未读公众号，每个号取最新 1 篇
+wx attachments "AI群"                           # 列出图片附件，返回 attachment_id
+wx extract "<attachment_id>" -o image.jpg        # 解密写出附件图片
 ```
 
 会话/消息输出里都带 `chat_type` 字段，取值为 `private` / `group` / `official_account` / `folded`。`official_account` 涵盖公众号、订阅号、服务号及 `mphelper` / `qqsafe` 等系统通知；`folded` 对应微信里的"订阅号折叠"和"折叠群聊"两个聚合入口。
+
+群聊里的 `history` / `search` / `new-messages` 消息行，以及 `stats.top_senders` 发言排行，会附带稳定身份字段：`sender_username`、兼容别名 `from_wxid`、`sender_contact_display`。字段来自消息库 `Name2Id.rowid -> user_name`，可区分昵称相同的群成员；解析不到稳定 ID 时不输出这些字段。
+
+`wx attachments` 输出的群聊图片附件同样会附带 `sender_username` / `from_wxid`，后续可把对应 `attachment_id` 交给 `wx extract` 写出真实图片文件。
 
 `wx transfers` 会自动去重同一笔转账在聊天里出现的多条卡片，输出逐笔 `transfers`、总汇总 `summary`，以及按月聚合的 `monthly_rows`。适合直接查询“这个月谁给我转了多少 / 我给他转了多少”。
 
@@ -188,6 +198,25 @@ wx search "会议" --in "工作群" --since 2026-01-01
 `wx asr-backfill` 用来一次性把历史聊天里的语音批量预转写到本地缓存。建议先跑 `wx asr-backfill --dry-run` 看待处理条数、总时长和预估费用，再决定要不要正式执行。
 
 首次使用 ASR 时会本地编译一个 `silk -> wav` helper，因此机器上需要有 `Go`；调用百炼脚本时需要 `python3`。如果终端没有显式设置 `DASHSCOPE_API_KEY`，脚本会继续尝试读取本机 AI Hub 里的 `aliyun_bailian_main` 配置。
+
+### 朋友圈（SNS）
+
+```bash
+wx sns-notifications                             # 点赞/评论通知（默认仅未读）
+wx sns-notifications --include-read -n 100       # 含已读
+
+wx sns-feed                                      # 近 20 条朋友圈（时间线）
+wx sns-feed --user "张三"                        # 限定作者
+wx sns-feed --since 2026-04-01 -n 100            # 按时间
+
+wx sns-search "关键词"                           # 全文搜索朋友圈正文
+wx sns-search "婚礼" --user "李四" --since 2023-01-01
+```
+
+- `sns-notifications` 返回互动通知：`type`（`like`/`comment`）、`from_nickname`、`content`、`feed_preview`、`feed_author`
+- `sns-feed` / `sns-search` 返回帖子：`author`、`content`、`media`、`media_count`、`location`、`timestamp`
+
+朋友圈数据只覆盖你本地刷到过的帖子（微信 app 按需下载）。
 
 ### 联系人 & 群组
 

@@ -5,7 +5,7 @@
 /// - OpenProcess: 获取进程句柄（需要 PROCESS_VM_READ | PROCESS_QUERY_INFORMATION）
 /// - VirtualQueryEx: 枚举内存区域
 /// - ReadProcessMemory: 读取内存内容
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::path::Path;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
@@ -13,7 +13,9 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Memory::{
-    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_READWRITE,
+    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE,
+    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOCACHE, PAGE_READWRITE, PAGE_WRITECOMBINE,
+    PAGE_WRITECOPY,
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 
@@ -116,8 +118,9 @@ fn scan_memory(process: HANDLE) -> Result<Vec<(String, String)>> {
         let region_size = mbi.RegionSize;
         let base = mbi.BaseAddress as usize;
 
-        // 只扫描已提交的可读写页面
-        if mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE {
+        // 只扫描已提交的可读可写页面。Windows 的保护位可能带 modifier bits，
+        // 也可能是 WRITECOPY / EXECUTE_READWRITE 这种同样可读可写的保护类型。
+        if mbi.State == MEM_COMMIT && is_writable_readable_page(mbi.Protect.0) {
             scan_region(process, base, region_size, &mut results);
         }
 
@@ -128,6 +131,17 @@ fn scan_memory(process: HANDLE) -> Result<Vec<(String, String)>> {
     }
 
     Ok(results)
+}
+
+fn is_writable_readable_page(protect: u32) -> bool {
+    let base = protect & !(PAGE_GUARD.0 | PAGE_NOCACHE.0 | PAGE_WRITECOMBINE.0);
+    matches!(
+        base,
+        x if x == PAGE_READWRITE.0
+            || x == PAGE_WRITECOPY.0
+            || x == PAGE_EXECUTE_READWRITE.0
+            || x == PAGE_EXECUTE_WRITECOPY.0
+    )
 }
 
 fn scan_region(process: HANDLE, base: usize, size: usize, results: &mut Vec<(String, String)>) {

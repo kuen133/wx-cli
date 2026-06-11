@@ -245,28 +245,6 @@ async fn dispatch(
                 Err(e) => Response::err(e.to_string()),
             }
         }
-        Moments {
-            limit,
-            user,
-            since,
-            until,
-            query: q,
-            with_media,
-        } => {
-            match query::q_moments(db, &names_arc, limit, user, since, until, q, with_media).await {
-                Ok(v) => Response::ok(v),
-                Err(e) => Response::err(e.to_string()),
-            }
-        }
-        MomentsInbox {
-            limit,
-            since,
-            until,
-            unread_only,
-        } => match query::q_moments_inbox(db, &names_arc, limit, since, until, unread_only).await {
-            Ok(v) => Response::ok(v),
-            Err(e) => Response::err(e.to_string()),
-        },
         SnsNotifications {
             limit,
             since,
@@ -289,6 +267,19 @@ async fn dispatch(
             Ok(v) => Response::ok(v),
             Err(e) => Response::err(e.to_string()),
         },
+        BizArticles {
+            limit,
+            account,
+            since,
+            until,
+            unread,
+        } => {
+            match query::q_biz_articles(db, &names_arc, limit, account, since, until, unread).await
+            {
+                Ok(v) => Response::ok(v),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
         SnsSearch {
             keyword,
             limit,
@@ -311,6 +302,42 @@ async fn dispatch(
                 Err(e) => Response::err(e.to_string()),
             }
         }
+        Attachments {
+            chat,
+            kinds,
+            limit,
+            offset,
+            since,
+            until,
+            with_meta,
+            debug_source,
+        } => {
+            match query::q_attachments(
+                db,
+                &names_arc,
+                &chat,
+                kinds,
+                limit,
+                offset,
+                since,
+                until,
+                with_meta,
+                debug_source,
+            )
+            .await
+            {
+                Ok(v) => Response::ok(v),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Extract {
+            attachment_id,
+            output,
+            overwrite,
+        } => match query::q_extract(db, &names_arc, &attachment_id, &output, overwrite).await {
+            Ok(v) => Response::ok(v),
+            Err(e) => Response::err(e.to_string()),
+        },
         FriendRequests {
             limit,
             since,

@@ -31,3 +31,35 @@
 - remote 名称：`wx-cli`，使用 SSH
 - 每次 commit 后立刻 push
 - 打 tag 用 `git tag vX.Y.Z && git push wx-cli vX.Y.Z`
+
+## AIHub / 局域网AI总表
+
+当用户提到 AIHub、局域网AI总表、家庭AI总表、AI总表、局域网AI配置表、大模型、provider、API key、调用模型、Gemini、Kimi、MiniMax、百炼、智谱、302.AI、OpenRouter、ChatGPT Pro、Claude Code、电脑、主机、SSH、NAS、M4、Windows、Proxmox、fnOS、远程访问时，第一步先读取本机 AIHub 注册表。
+
+优先路径：
+
+1. `$LAN_AI_REGISTRY_PATH`
+2. `~/.config/局域网AI总表.json`
+3. `~/.config/aihub/aihub.json`
+4. `~/Library/Application Support/AIHub/aihub.json`
+
+读取时只取需要的 subtree：
+
+- 模型/API：`.catalog.providers`
+- 主机/电脑/远程访问：`.catalog.hosts`
+- 路由规则：对应 provider 的 `routing_guidance`、`routing_notes`、`notes`
+- 注册表发现规则：`.discovery_contract`
+
+默认不要在回答中明文展示 `api_key`、`password`、`token`、OAuth、私钥或其他密钥。需要调用模型或访问主机时，可以读取密钥用于本地命令；除非用户明确要求展示密钥，否则输出必须脱敏。远程破坏性操作前先确认。
+
+优先使用 `aihub` CLI：
+
+```bash
+aihub overview
+aihub providers
+aihub provider ai302_main
+aihub hosts
+aihub host m4-mac
+aihub chat --provider ai302_main --prompt "hello"
+aihub ssh m4-mac -- hostname
+```

@@ -9,6 +9,9 @@ decoded_images/
 *.db-wal
 *.db.tmp_monitor
 
+# Local analysis outputs (private) - NEVER upload
+.codex-output/
+
 # Hook outputs
 hook_output.txt
 hook_start_output.txt

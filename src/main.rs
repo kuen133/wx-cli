@@ -1,3 +1,4 @@
+mod attachment;
 mod cli;
 mod config;
 mod crypto;

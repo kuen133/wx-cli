@@ -5,7 +5,10 @@ use roxmltree::{Document, Node};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+use crate::config;
 
 use super::cache::DbCache;
 use super::voice_asr;
@@ -222,12 +225,16 @@ pub async fn q_history(
     }
 
     let mut all_msgs: Vec<Value> = Vec::new();
+    let account_root = config::load_config()
+        .ok()
+        .and_then(|cfg| cfg.db_dir.parent().map(Path::to_path_buf));
     for (db_path, table_name) in &tables {
         let path = db_path.clone();
         let tname = table_name.clone();
         let uname = username.clone();
         let is_group2 = is_group;
         let names_map = names.map.clone();
+        let account_root2 = account_root.clone();
         let since2 = since;
         let until2 = until;
         let limit2 = limit;
@@ -237,8 +244,17 @@ pub async fn q_history(
             // per-DB 软上限：offset + limit 已足够全局分页，避免大群全量加载
             let per_db_cap = offset2 + limit2;
             query_messages(
-                &path, &tname, &uname, is_group2, &names_map, since2, until2, msg_type, per_db_cap,
+                &path,
+                &tname,
+                &uname,
+                is_group2,
+                &names_map,
+                since2,
+                until2,
+                msg_type,
+                per_db_cap,
                 0,
+                account_root2.as_deref(),
             )
         })
         .await??;
@@ -769,6 +785,7 @@ fn query_messages(
     msg_type: Option<i64>,
     limit: usize,
     offset: usize,
+    account_root: Option<&Path>,
 ) -> Result<Vec<Value>> {
     let conn = Connection::open(db_path)?;
     let id2u = load_id2u(&conn);
@@ -822,6 +839,8 @@ fn query_messages(
     let mut result = Vec::new();
     for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
         let content = decompress_message(&content_bytes, ct);
+        let sender_username =
+            sender_username(real_sender_id, &content, is_group, chat_username, &id2u);
         let sender = sender_label(
             real_sender_id,
             &content,
@@ -832,16 +851,160 @@ fn query_messages(
         );
         let text = fmt_content(local_id, local_type, &content, is_group);
 
-        result.push(json!({
+        let mut item = json!({
             "timestamp": ts,
             "time": fmt_time(ts, "%Y-%m-%d %H:%M"),
             "sender": sender,
             "content": text,
             "type": fmt_type(local_type),
             "local_id": local_id,
-        }));
+        });
+        add_sender_identity(&mut item, is_group, &sender_username, names_map);
+
+        let image_paths = account_root
+            .map(|root| existing_image_paths(root, table, local_id, ts))
+            .unwrap_or_default();
+        if !image_paths.is_empty() {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert(
+                    "image_paths".into(),
+                    Value::Array(
+                        image_paths
+                            .iter()
+                            .map(|path| Value::String(path.to_string_lossy().into_owned()))
+                            .collect(),
+                    ),
+                );
+                obj.insert(
+                    "image_path".into(),
+                    Value::String(image_paths[0].to_string_lossy().into_owned()),
+                );
+            }
+        }
+
+        result.push(item);
     }
     Ok(result)
+}
+
+fn image_cache_candidates(
+    account_root: &Path,
+    table: &str,
+    local_id: i64,
+    create_time: i64,
+) -> Vec<PathBuf> {
+    let Some(session_hash) = table.strip_prefix("Msg_") else {
+        return Vec::new();
+    };
+    if session_hash.len() != 32 || !session_hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Vec::new();
+    }
+
+    let month = fmt_time(create_time, "%Y-%m");
+    vec![account_root.join(format!(
+        "cache/{}/Message/{}/Thumb/{}_{}_thumb.jpg",
+        month, session_hash, local_id, create_time
+    ))]
+}
+
+fn bubble_cache_candidate(
+    account_root: &Path,
+    table: &str,
+    local_id: i64,
+    create_time: i64,
+) -> Option<PathBuf> {
+    let session_hash = table.strip_prefix("Msg_")?;
+    if session_hash.len() != 32 || !session_hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let month = fmt_time(create_time, "%Y-%m");
+    Some(account_root.join(format!(
+        "cache/{}/Message/{}/Bubble/{}_{}_b.dat",
+        month, session_hash, local_id, create_time
+    )))
+}
+
+fn existing_image_paths(
+    account_root: &Path,
+    table: &str,
+    local_id: i64,
+    create_time: i64,
+) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> =
+        image_cache_candidates(account_root, table, local_id, create_time)
+            .into_iter()
+            .filter(|path| path.is_file())
+            .collect();
+
+    if let Some(bubble_path) = bubble_cache_candidate(account_root, table, local_id, create_time) {
+        if let Some(extracted) =
+            materialize_embedded_image(table, local_id, create_time, &bubble_path)
+        {
+            paths.push(extracted);
+        }
+    }
+
+    paths
+}
+
+fn materialize_embedded_image(
+    table: &str,
+    local_id: i64,
+    create_time: i64,
+    source: &Path,
+) -> Option<PathBuf> {
+    if !source.is_file() {
+        return None;
+    }
+
+    let session_hash = table.strip_prefix("Msg_")?;
+    let bytes = std::fs::read(source).ok()?;
+    let image = extract_embedded_image_bytes(&bytes)?;
+    let extension = embedded_image_extension(&image)?;
+    let output_dir = config::cache_dir().join("image_extract").join(session_hash);
+    std::fs::create_dir_all(&output_dir).ok()?;
+    let output = output_dir.join(format!("{}_{}{}", local_id, create_time, extension));
+    if output.is_file() {
+        return Some(output);
+    }
+    std::fs::write(&output, image).ok()?;
+    Some(output)
+}
+
+fn extract_embedded_image_bytes(data: &[u8]) -> Option<Vec<u8>> {
+    for signature in [
+        &[0xff, 0xd8, 0xff][..],
+        &[0x89, b'P', b'N', b'G'][..],
+        b"GIF8".as_slice(),
+    ] {
+        if let Some(offset) = find_bytes(data, signature) {
+            return Some(data[offset..].to_vec());
+        }
+    }
+    None
+}
+
+fn embedded_image_extension(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some(".jpg");
+    }
+    if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Some(".png");
+    }
+    if data.starts_with(b"GIF8") {
+        return Some(".gif");
+    }
+    None
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn query_transfer_messages(
@@ -1231,6 +1394,8 @@ fn search_in_table(
     let mut result = Vec::new();
     for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
         let content = decompress_message(&content_bytes, ct);
+        let sender_username =
+            sender_username(real_sender_id, &content, is_group, chat_username, &id2u);
         let sender = sender_label(
             real_sender_id,
             &content,
@@ -1241,14 +1406,16 @@ fn search_in_table(
         );
         let text = fmt_content(local_id, local_type, &content, is_group);
 
-        result.push(json!({
+        let mut item = json!({
             "timestamp": ts,
             "time": fmt_time(ts, "%Y-%m-%d %H:%M"),
             "chat": "",
             "sender": sender,
             "content": text,
             "type": fmt_type(local_type),
-        }));
+        });
+        add_sender_identity(&mut item, is_group, &sender_username, names_map);
+        result.push(item);
     }
     Ok(result)
 }
@@ -1267,6 +1434,48 @@ fn load_id2u(conn: &Connection) -> HashMap<i64, String> {
             });
     }
     map
+}
+
+fn sender_username(
+    real_sender_id: i64,
+    content: &str,
+    is_group: bool,
+    chat_username: &str,
+    id2u: &HashMap<i64, String>,
+) -> String {
+    let sender_uname = id2u.get(&real_sender_id).cloned().unwrap_or_default();
+    if !is_group {
+        if !sender_uname.is_empty() && sender_uname != chat_username {
+            return sender_uname;
+        }
+        return String::new();
+    }
+    if !sender_uname.is_empty() && sender_uname != chat_username {
+        return sender_uname;
+    }
+    if content.contains(":\n") {
+        return content.splitn(2, ":\n").next().unwrap_or("").to_string();
+    }
+    String::new()
+}
+
+fn add_sender_identity(
+    row: &mut Value,
+    is_group: bool,
+    username: &str,
+    names: &HashMap<String, String>,
+) {
+    if !is_group || username.is_empty() {
+        return;
+    }
+    row["sender_username"] = Value::String(username.to_string());
+    row["from_wxid"] = Value::String(username.to_string());
+    row["sender_contact_display"] = Value::String(
+        names
+            .get(username)
+            .cloned()
+            .unwrap_or_else(|| username.to_string()),
+    );
 }
 
 fn sender_label(
@@ -1983,6 +2192,8 @@ pub async fn q_new_messages(
                 let mut result = Vec::new();
                 for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
                     let content = decompress_message(&content_bytes, ct);
+                    let sender_username =
+                        sender_username(real_sender_id, &content, is_group, &uname2, &id2u);
                     let sender = sender_label(
                         real_sender_id,
                         &content,
@@ -1992,7 +2203,7 @@ pub async fn q_new_messages(
                         &names_map,
                     );
                     let text = fmt_content(local_id, local_type, &content, is_group);
-                    result.push(json!({
+                    let mut msg = json!({
                         "chat": display2,
                         "username": uname2,
                         "is_group": is_group,
@@ -2002,7 +2213,9 @@ pub async fn q_new_messages(
                         "sender": sender,
                         "content": text,
                         "type": fmt_type(local_type),
-                    }));
+                    });
+                    add_sender_identity(&mut msg, is_group, &sender_username, &names_map);
+                    result.push(msg);
                 }
                 Ok::<_, anyhow::Error>(result)
             })
@@ -2190,7 +2403,6 @@ pub async fn q_stats(
         let tname = table_name.clone();
         let uname = username.clone();
         let is_group2 = is_group;
-        let names_map = names.map.clone();
 
         // 用 SQL GROUP BY 在数据库侧聚合，避免把全量消息内容加载进内存
         let result: (i64, HashMap<String, i64>, HashMap<String, i64>, [i64; 24]) =
@@ -2277,8 +2489,7 @@ pub async fn q_stats(
                             for (id, cnt) in rows.flatten() {
                                 if let Some(u) = id2u.get(&id) {
                                     if u != &uname {
-                                        let name = names_map.get(u).cloned().unwrap_or_else(|| u.clone());
-                                        *sender_c.entry(name).or_insert(0) += cnt;
+                                        *sender_c.entry(u.clone()).or_insert(0) += cnt;
                                     }
                                 }
                             }
@@ -2312,7 +2523,14 @@ pub async fn q_stats(
     // 发言排行，Top 10
     let mut top_senders: Vec<Value> = sender_counts
         .iter()
-        .map(|(s, c)| json!({ "sender": s, "count": c }))
+        .map(|(username, count)| {
+            let mut row = json!({
+                "sender": names.map.get(username).cloned().unwrap_or_else(|| username.clone()),
+                "count": count,
+            });
+            add_sender_identity(&mut row, true, username, &names.map);
+            row
+        })
         .collect();
     top_senders.sort_by_key(|v| std::cmp::Reverse(v["count"].as_i64().unwrap_or(0)));
     top_senders.truncate(10);
@@ -2336,135 +2554,7 @@ pub async fn q_stats(
     }))
 }
 
-// ─── 朋友圈（Moments / SNS） ───────────────────────────────────────────────────
-
-/// 兼容旧 `wx moments` 命令：底层复用新的 sns-feed / sns-search 解析结果，
-/// 再映射回历史输出字段，保证 dossier app 和旧脚本都还能直接消费。
-pub async fn q_moments(
-    db: &DbCache,
-    names: &Names,
-    limit: usize,
-    user: Option<String>,
-    since: Option<i64>,
-    until: Option<i64>,
-    query: Option<String>,
-    with_media: bool,
-) -> Result<Value> {
-    let sns_payload = match query.filter(|keyword| !keyword.trim().is_empty()) {
-        Some(keyword) => {
-            q_sns_search(db, names, &keyword, limit, since, until, user.as_deref()).await?
-        }
-        None => q_sns_feed(db, names, limit, since, until, user.as_deref()).await?,
-    };
-    Ok(legacy_moments_from_posts(&sns_payload, with_media))
-}
-
-/// 查询朋友圈收件箱（别人对我的评论/点赞通知）。
-/// 数据来自 `sns/sns.db` 的 `SnsMessage_tmp3` 表。
-/// type 映射：1=点赞 / 2=评论 / 其他。
-pub async fn q_moments_inbox(
-    db: &DbCache,
-    names: &Names,
-    limit: usize,
-    since: Option<i64>,
-    until: Option<i64>,
-    unread_only: bool,
-) -> Result<Value> {
-    let path = db.get("sns/sns.db").await?.context("无法解密 sns.db")?;
-
-    let rows: Vec<(i64, i64, String, String, String, String, String, i64, i64)> =
-        tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(&path)?;
-            let mut clauses: Vec<&'static str> = Vec::new();
-            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            if let Some(s) = since {
-                clauses.push("create_time >= ?");
-                params.push(Box::new(s));
-            }
-            if let Some(u) = until {
-                clauses.push("create_time <= ?");
-                params.push(Box::new(u));
-            }
-            if unread_only {
-                clauses.push("is_unread = 1");
-            }
-            let where_clause = if clauses.is_empty() {
-                String::new()
-            } else {
-                format!("WHERE {}", clauses.join(" AND "))
-            };
-            params.push(Box::new(limit as i64));
-
-            let sql = format!(
-                "SELECT create_time, type, from_username, from_nickname, \
-                    to_username, to_nickname, content, feed_id, is_unread \
-             FROM SnsMessage_tmp3 {} ORDER BY create_time DESC LIMIT ?",
-                where_clause
-            );
-            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p.as_ref()).collect();
-            let mut stmt = conn.prepare(&sql)?;
-            let rows: Vec<_> = stmt
-                .query_map(params_ref.as_slice(), |r| {
-                    Ok((
-                        r.get::<_, i64>(0).unwrap_or(0),
-                        r.get::<_, i64>(1).unwrap_or(0),
-                        r.get::<_, String>(2).unwrap_or_default(),
-                        r.get::<_, String>(3).unwrap_or_default(),
-                        r.get::<_, String>(4).unwrap_or_default(),
-                        r.get::<_, String>(5).unwrap_or_default(),
-                        r.get::<_, String>(6).unwrap_or_default(),
-                        r.get::<_, i64>(7).unwrap_or(0),
-                        r.get::<_, i64>(8).unwrap_or(0),
-                    ))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
-            Ok::<_, anyhow::Error>(rows)
-        })
-        .await??;
-
-    let out: Vec<Value> = rows
-        .into_iter()
-        .map(
-            |(ts, typ, from_u, from_n, to_u, to_n, content, feed_id, unread)| {
-                let action = match typ {
-                    1 => "like",
-                    2 => "comment",
-                    _ => "other",
-                };
-                let from_disp = if !from_u.is_empty() && names.map.contains_key(&from_u) {
-                    names.display(&from_u)
-                } else {
-                    from_n.clone()
-                };
-                let to_disp = if !to_u.is_empty() && names.map.contains_key(&to_u) {
-                    names.display(&to_u)
-                } else {
-                    to_n.clone()
-                };
-
-                let mut obj = serde_json::Map::new();
-                obj.insert("time".into(), json!(fmt_time(ts, "%Y-%m-%d %H:%M")));
-                obj.insert("timestamp".into(), json!(ts));
-                obj.insert("action".into(), json!(action));
-                obj.insert("from".into(), json!(from_disp));
-                obj.insert("from_username".into(), json!(from_u));
-                obj.insert("to".into(), json!(to_disp));
-                obj.insert("feed_id".into(), json!(feed_id.to_string()));
-                if !content.is_empty() {
-                    obj.insert("content".into(), json!(content));
-                }
-                if unread != 0 {
-                    obj.insert("unread".into(), json!(true));
-                }
-                Value::Object(obj)
-            },
-        )
-        .collect();
-
-    Ok(json!({ "count": out.len(), "inbox": out }))
-}
+// ─── 朋友圈（SNS） ───────────────────────────────────────────────────────────
 
 /// 查询朋友圈互动通知（点赞 + 评论），对应微信 app 右上角的红点入口。
 /// 空 `content` 是点赞，非空是评论正文。
@@ -2609,113 +2699,6 @@ pub async fn q_sns_notifications(
 
 const SNS_MAX_LIMIT: usize = 10_000;
 const SNS_MAX_SCAN: usize = 50_000;
-
-fn legacy_moments_from_posts(payload: &Value, with_media: bool) -> Value {
-    let Some(posts) = payload.get("posts").and_then(Value::as_array) else {
-        return json!({ "count": 0, "moments": [] });
-    };
-
-    let moments: Vec<Value> = posts
-        .iter()
-        .map(|post| {
-            let media = post
-                .get("media")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let has_video = media.iter().any(|item| {
-                item.get("video_duration").and_then(Value::as_i64).is_some()
-                    || item.get("type").and_then(Value::as_str) == Some("15")
-            });
-            let kind = if has_video {
-                "video"
-            } else if !media.is_empty() {
-                "photos"
-            } else {
-                "text"
-            };
-
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "id".into(),
-                Value::String(
-                    post.get("id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .or_else(|| {
-                            post.get("tid")
-                                .and_then(Value::as_i64)
-                                .map(|value| value.to_string())
-                        })
-                        .unwrap_or_default(),
-                ),
-            );
-            obj.insert(
-                "author".into(),
-                Value::String(
-                    post.get("author")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                ),
-            );
-            obj.insert(
-                "username".into(),
-                Value::String(
-                    post.get("username")
-                        .and_then(Value::as_str)
-                        .or_else(|| post.get("author_username").and_then(Value::as_str))
-                        .unwrap_or_default()
-                        .to_string(),
-                ),
-            );
-            obj.insert(
-                "text".into(),
-                Value::String(
-                    post.get("text")
-                        .and_then(Value::as_str)
-                        .or_else(|| post.get("content").and_then(Value::as_str))
-                        .unwrap_or_default()
-                        .to_string(),
-                ),
-            );
-            obj.insert(
-                "time".into(),
-                Value::String(
-                    post.get("time")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                ),
-            );
-            obj.insert(
-                "timestamp".into(),
-                Value::from(post.get("timestamp").and_then(Value::as_i64).unwrap_or(0)),
-            );
-            obj.insert("type".into(), Value::String(kind.to_string()));
-            if with_media && !media.is_empty() {
-                obj.insert("media".into(), Value::Array(media));
-            } else if !media.is_empty() {
-                obj.insert("media_count".into(), Value::from(media.len() as i64));
-            } else if let Some(count) = post.get("media_count").and_then(Value::as_i64) {
-                obj.insert("media_count".into(), Value::from(count));
-            }
-            if let Some(location) = post.get("location").and_then(Value::as_str) {
-                if !location.is_empty() {
-                    obj.insert("location".into(), Value::String(location.to_string()));
-                }
-            }
-            if let Some(link) = post.get("link").and_then(Value::as_str) {
-                if !link.is_empty() {
-                    obj.insert("link".into(), Value::String(link.to_string()));
-                }
-            }
-            Value::Object(obj)
-        })
-        .collect();
-
-    json!({ "count": moments.len(), "moments": moments })
-}
 
 fn escape_like_pattern(s: &str) -> String {
     s.replace('\\', r"\\")
@@ -3180,9 +3163,578 @@ fn fm_type_str(t: i64) -> &'static str {
     }
 }
 
+// ─── 公众号文章查询 ───────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct BizArticle {
+    recv_time: i64,
+    account_username: String,
+    title: String,
+    url: String,
+    digest: String,
+    cover: String,
+    pub_time: i64,
+}
+
+fn parse_biz_xml_items(recv_time: i64, account_username: &str, xml: &str) -> Vec<BizArticle> {
+    let mut items = Vec::new();
+    let mut search_from = 0;
+    loop {
+        let Some(item_start) = xml[search_from..].find("<item>") else {
+            break;
+        };
+        let abs_start = search_from + item_start;
+        let Some(item_end) = xml[abs_start..].find("</item>") else {
+            break;
+        };
+        let abs_end = abs_start + item_end + 7;
+        let item_xml = &xml[abs_start..abs_end];
+
+        let title = extract_cdata(item_xml, "title").unwrap_or_default();
+        let url = extract_cdata(item_xml, "url").unwrap_or_default();
+        if url.is_empty() || title.is_empty() {
+            search_from = abs_end;
+            continue;
+        }
+        let digest = extract_cdata(item_xml, "digest").unwrap_or_default();
+        let cover = extract_cdata(item_xml, "cover").unwrap_or_default();
+        let pub_time = extract_xml_text(item_xml, "pub_time")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(recv_time);
+
+        items.push(BizArticle {
+            recv_time,
+            account_username: account_username.to_string(),
+            title,
+            url,
+            digest,
+            cover,
+            pub_time,
+        });
+        search_from = abs_end;
+    }
+    items
+}
+
+fn extract_cdata(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)?;
+    let inner = xml[start..start + end].trim();
+    if inner.starts_with("<![CDATA[") {
+        let body = &inner[9..];
+        let content = if body.as_bytes().ends_with(b"]]>") {
+            &body[..body.len() - 3]
+        } else if body.as_bytes().ends_with(b"]]") {
+            &body[..body.len() - 2]
+        } else {
+            body
+        };
+        let content = content.trim();
+        if content.is_empty() {
+            None
+        } else {
+            Some(content.to_string())
+        }
+    } else if inner.is_empty() {
+        None
+    } else {
+        Some(unescape_html(inner))
+    }
+}
+
+pub async fn q_biz_articles(
+    db: &DbCache,
+    names: &Names,
+    limit: usize,
+    account: Option<String>,
+    since: Option<i64>,
+    until: Option<i64>,
+    unread: bool,
+) -> Result<Value> {
+    let biz_path = db
+        .get("message/biz_message_0.db")
+        .await?
+        .context("无法解密 biz_message_0.db，请确认 all_keys.json 包含对应密钥")?;
+
+    let unread_usernames: Option<std::collections::HashSet<String>> = if unread {
+        let session_path = db
+            .get("session/session.db")
+            .await?
+            .context("无法解密 session.db")?;
+        let unread_rows: Vec<String> = tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&session_path)?;
+            let mut stmt =
+                conn.prepare("SELECT username FROM SessionTable WHERE unread_count > 0")?;
+            let rows: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok::<_, anyhow::Error>(rows)
+        })
+        .await??;
+
+        let set: std::collections::HashSet<String> = unread_rows
+            .into_iter()
+            .filter(|u| chat_type_of(u, names) == "official_account")
+            .collect();
+        if set.is_empty() {
+            return Ok(json!({ "count": 0, "articles": [] }));
+        }
+        Some(set)
+    } else {
+        None
+    };
+
+    let biz_path2 = biz_path.clone();
+    let id2username: HashMap<i64, String> = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(&biz_path2)?;
+        let mut stmt =
+            conn.prepare("SELECT rowid, user_name FROM Name2Id WHERE user_name LIKE 'gh_%'")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok::<_, anyhow::Error>(rows.into_iter().collect())
+    })
+    .await??;
+
+    let md5_to_uname: HashMap<String, String> = id2username
+        .values()
+        .map(|u| (format!("{:x}", md5::compute(u.as_bytes())), u.clone()))
+        .collect();
+
+    let account_low = account.as_deref().map(|s| s.to_lowercase());
+    let mut target_usernames: Option<Vec<String>> = account_low.as_ref().map(|low| {
+        id2username
+            .values()
+            .filter(|u| {
+                let display = names.display(u);
+                display.to_lowercase().contains(low.as_str())
+                    || u.to_lowercase().contains(low.as_str())
+            })
+            .cloned()
+            .collect()
+    });
+
+    if let Some(ref unread_set) = unread_usernames {
+        target_usernames = Some(match target_usernames.take() {
+            Some(acc_list) => acc_list
+                .into_iter()
+                .filter(|u| unread_set.contains(u))
+                .collect(),
+            None => unread_set.iter().cloned().collect(),
+        });
+        if target_usernames
+            .as_ref()
+            .map(|v| v.is_empty())
+            .unwrap_or(false)
+        {
+            return Ok(json!({ "count": 0, "articles": [] }));
+        }
+    }
+
+    let biz_path3 = biz_path.clone();
+    let target_hashes: Option<Vec<String>> = target_usernames.as_ref().map(|unames| {
+        unames
+            .iter()
+            .map(|u| format!("{:x}", md5::compute(u.as_bytes())))
+            .collect()
+    });
+
+    let rows: Vec<(String, i64, i64, Vec<u8>)> = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(&biz_path3)?;
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")?;
+        let table_names: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let re = regex::Regex::new(r"^Msg_[0-9a-f]{32}$").unwrap();
+        let mut all_rows: Vec<(String, i64, i64, Vec<u8>)> = Vec::new();
+
+        for tname in &table_names {
+            if !re.is_match(tname) {
+                continue;
+            }
+            let hash = &tname[4..];
+            if let Some(ref hashes) = target_hashes {
+                if !hashes.iter().any(|h| h == hash) {
+                    continue;
+                }
+            }
+            let username = md5_to_uname.get(hash).cloned().unwrap_or_default();
+
+            let mut clauses: Vec<String> = vec!["(local_type & 4294967295) = 49".to_string()];
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            if let Some(s) = since {
+                clauses.push("create_time >= ?".to_string());
+                params.push(Box::new(s));
+            }
+            if let Some(u) = until {
+                clauses.push("create_time <= ?".to_string());
+                params.push(Box::new(u));
+            }
+            let where_clause = format!("WHERE {}", clauses.join(" AND "));
+            let sql = format!(
+                "SELECT create_time, WCDB_CT_message_content, message_content \
+                 FROM [{}] {} ORDER BY create_time DESC",
+                tname, where_clause
+            );
+
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            if let Ok(mut inner_stmt) = conn.prepare(&sql) {
+                let msg_rows: Vec<_> = inner_stmt
+                    .query_map(params_ref.as_slice(), |row| {
+                        Ok((
+                            username.clone(),
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1).unwrap_or(0),
+                            get_content_bytes(row, 2),
+                        ))
+                    })
+                    .map(|it| it.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default();
+                all_rows.extend(msg_rows);
+            }
+        }
+        Ok::<_, anyhow::Error>(all_rows)
+    })
+    .await??;
+
+    let mut articles: Vec<BizArticle> = Vec::new();
+    for (username, recv_time, ct, content_bytes) in rows {
+        let content = decompress_message(&content_bytes, ct);
+        if !content.is_empty() {
+            articles.extend(parse_biz_xml_items(recv_time, &username, &content));
+        }
+    }
+
+    articles.sort_by_key(|a| std::cmp::Reverse(a.pub_time));
+    if unread {
+        let mut seen = std::collections::HashSet::<String>::new();
+        articles.retain(|a| seen.insert(a.account_username.clone()));
+    }
+    articles.truncate(limit);
+
+    let results: Vec<Value> = articles
+        .into_iter()
+        .map(|a| {
+            json!({
+                "time": fmt_time(a.pub_time, "%Y-%m-%d %H:%M"),
+                "timestamp": a.pub_time,
+                "recv_time": a.recv_time,
+                "recv_time_str": fmt_time(a.recv_time, "%Y-%m-%d %H:%M"),
+                "account": names.display(&a.account_username),
+                "account_username": a.account_username,
+                "title": a.title,
+                "url": a.url,
+                "digest": a.digest,
+                "cover_url": a.cover,
+            })
+        })
+        .collect();
+
+    Ok(json!({ "count": results.len(), "articles": results }))
+}
+
+// ─── 附件（当前先支持图片）查询与提取 ─────────────────────────────────
+
+pub async fn q_attachments(
+    db: &DbCache,
+    names: &Names,
+    chat: &str,
+    kinds: Option<Vec<String>>,
+    limit: usize,
+    offset: usize,
+    since: Option<i64>,
+    until: Option<i64>,
+    _with_meta: bool,
+    _debug_source: bool,
+) -> Result<Value> {
+    use crate::attachment::{AttachmentId, AttachmentKind};
+
+    let username =
+        resolve_username(chat, names).with_context(|| format!("找不到联系人: {}", chat))?;
+    let display = names.display(&username);
+    let chat_type = chat_type_of(&username, names);
+    let is_group = chat_type == "group";
+
+    let kind_filters = parse_attachment_kinds(kinds.as_deref())?;
+    if kind_filters.is_empty() {
+        anyhow::bail!("kinds 为空 — 当前至少传一种 image");
+    }
+    let lo32_types: Vec<i64> = kind_filters.iter().map(|(_, t)| *t).collect();
+    let type_to_kind: HashMap<i64, AttachmentKind> =
+        kind_filters.iter().map(|(k, t)| (*t, *k)).collect();
+
+    let tables = find_msg_tables(db, names, &username).await?;
+    if tables.is_empty() {
+        anyhow::bail!("找不到 {} 的消息记录", display);
+    }
+
+    let mut all_rows: Vec<(i64, i64, i64, String, String)> = Vec::new();
+    for (db_path, table_name) in tables {
+        let path = db_path.clone();
+        let tname = table_name.clone();
+        let uname = username.clone();
+        let names_map = names.map.clone();
+        let lo32_types2 = lo32_types.clone();
+
+        let rows: Vec<(i64, i64, i64, String, String)> = tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&path)?;
+            let id2u = load_id2u(&conn);
+            let placeholders = lo32_types2
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut clauses: Vec<String> =
+                vec![format!("(local_type & 4294967295) IN ({})", placeholders)];
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = lo32_types2
+                .iter()
+                .map(|t| Box::new(*t) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            if let Some(s) = since {
+                clauses.push("create_time >= ?".into());
+                params.push(Box::new(s));
+            }
+            if let Some(u) = until {
+                clauses.push("create_time <= ?".into());
+                params.push(Box::new(u));
+            }
+            let where_clause = format!("WHERE {}", clauses.join(" AND "));
+            let sql = format!(
+                "SELECT local_id, local_type, create_time, real_sender_id,
+                            message_content, WCDB_CT_message_content
+                     FROM [{}] {} ORDER BY create_time DESC LIMIT ?",
+                tname, where_clause
+            );
+            params.push(Box::new(((offset + limit).max(limit) * 2) as i64));
+
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows: Vec<(i64, i64, i64, String, String)> = stmt
+                .query_map(params_ref.as_slice(), |row| {
+                    let local_id: i64 = row.get(0)?;
+                    let raw_type: i64 = row.get(1)?;
+                    let lo32 = (raw_type as u64 & 0xFFFFFFFF) as i64;
+                    let ts: i64 = row.get(2)?;
+                    let real_sender_id: i64 = row.get(3)?;
+                    let content_bytes = get_content_bytes(row, 4);
+                    let ct: i64 = row.get::<_, i64>(5).unwrap_or(0);
+                    let content = decompress_message(&content_bytes, ct);
+                    let sender = if is_group {
+                        sender_label(real_sender_id, &content, true, &uname, &id2u, &names_map)
+                    } else {
+                        String::new()
+                    };
+                    let sender_uname = if is_group {
+                        sender_username(real_sender_id, &content, true, &uname, &id2u)
+                    } else {
+                        String::new()
+                    };
+                    Ok((local_id, lo32, ts, sender, sender_uname))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok::<_, anyhow::Error>(rows)
+        })
+        .await??;
+
+        all_rows.extend(rows);
+    }
+
+    all_rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+    let paged: Vec<_> = all_rows.into_iter().skip(offset).take(limit).collect();
+
+    let mut results: Vec<Value> = Vec::with_capacity(paged.len());
+    for (local_id, lo32, ts, sender, sender_uname) in paged {
+        let kind = type_to_kind
+            .get(&lo32)
+            .copied()
+            .unwrap_or(crate::attachment::AttachmentKind::Image);
+        let id = AttachmentId {
+            v: 1,
+            chat: username.clone(),
+            local_id,
+            create_time: ts,
+            kind,
+            db: None,
+        };
+        let mut row = json!({
+            "attachment_id": id.encode()?,
+            "kind": kind.as_str(),
+            "type": fmt_type(lo32),
+            "local_id": local_id,
+            "timestamp": ts,
+            "time": fmt_time(ts, "%Y-%m-%d %H:%M"),
+        });
+        if is_group && !sender.is_empty() {
+            row["sender"] = Value::String(sender);
+        }
+        add_sender_identity(&mut row, is_group, &sender_uname, &names.map);
+        results.push(row);
+    }
+
+    Ok(json!({
+        "chat": display,
+        "username": username,
+        "is_group": is_group,
+        "chat_type": chat_type,
+        "count": results.len(),
+        "attachments": results,
+    }))
+}
+
+pub async fn q_extract(
+    db: &DbCache,
+    _names: &Names,
+    attachment_id: &str,
+    output: &str,
+    overwrite: bool,
+) -> Result<Value> {
+    use crate::attachment::{
+        attachment_id::AttachmentId,
+        decoder::{self, V2KeyMaterial},
+        image_key, resolver,
+    };
+
+    let id = AttachmentId::decode(attachment_id)
+        .context("解析 attachment_id 失败（不是合法 base64url(json)？）")?;
+
+    let output_path = std::path::PathBuf::from(output);
+    if output_path.exists() && !overwrite {
+        anyhow::bail!(
+            "目标已存在：{}（加 --overwrite 覆盖）",
+            output_path.display()
+        );
+    }
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("创建输出目录失败：{}", parent.display()))?;
+        }
+    }
+
+    let resource_path = db
+        .get("message/message_resource.db")
+        .await?
+        .context("无法解密 message_resource.db（请确认 all_keys.json 包含该 DB 的密钥）")?;
+    let wxchat_base = db
+        .db_dir()
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("db_dir 没有 parent，无法推断 xwechat_files 根目录"))?
+        .to_path_buf();
+    let attach_root = resolver::attach_root_for(&wxchat_base);
+
+    let id_for_task = id.clone();
+    let resource_path2 = resource_path.clone();
+    let attach_root2 = attach_root.clone();
+    let wxchat_base2 = wxchat_base.clone();
+    let output_path2 = output_path.clone();
+
+    let report: Value = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let resolved = resolver::resolve_blocking(&id_for_task, &resource_path2, &attach_root2)?;
+        let dat_bytes = std::fs::read(&resolved.dat_path)
+            .with_context(|| format!("读取 .dat 失败：{}", resolved.dat_path.display()))?;
+
+        let provider = image_key::default_provider();
+        let key_material = if let Some(p) = provider.as_ref() {
+            let wxid = wxchat_base2
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if wxid.is_empty() {
+                None
+            } else {
+                match p.get_key(&wxid) {
+                    Ok(km) => Some(km),
+                    Err(e) => {
+                        eprintln!(
+                            "[extract] image key 提取失败 (wxid={}): {} — V2 文件将无法解码",
+                            wxid, e
+                        );
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let v2_key = match key_material.as_ref() {
+            Some(km) => V2KeyMaterial {
+                aes_key: Some(&km.aes_key),
+                xor_key: km.xor_key,
+            },
+            None => V2KeyMaterial::default(),
+        };
+
+        let decoded = decoder::dispatch(&dat_bytes, v2_key)?;
+        std::fs::write(&output_path2, &decoded.data)
+            .with_context(|| format!("写出文件失败：{}", output_path2.display()))?;
+
+        Ok(json!({
+            "kind": id_for_task.kind.as_str(),
+            "md5": resolved.md5,
+            "dat_path": resolved.dat_path.display().to_string(),
+            "dat_size": resolved.size,
+            "output": output_path2.display().to_string(),
+            "output_size": decoded.data.len(),
+            "format": decoded.format,
+            "decoder": decoded.decoder,
+        }))
+    })
+    .await??;
+
+    Ok(report)
+}
+
+fn parse_attachment_kinds(
+    kinds: Option<&[String]>,
+) -> Result<Vec<(crate::attachment::AttachmentKind, i64)>> {
+    use crate::attachment::AttachmentKind;
+    let raw = kinds.unwrap_or(&[]);
+    if raw.is_empty() {
+        return Ok(vec![(AttachmentKind::Image, 3)]);
+    }
+    let mut out: Vec<(AttachmentKind, i64)> = Vec::with_capacity(raw.len());
+    let mut seen = std::collections::HashSet::<&'static str>::new();
+    for k in raw {
+        let (kind, t): (AttachmentKind, i64) = match k.to_ascii_lowercase().as_str() {
+            "image" | "img" => (AttachmentKind::Image, 3),
+            "voice" | "audio" | "video" | "file" => {
+                anyhow::bail!(
+                    "当前只支持 image 提取；video/file/voice 的资源路径与 decoder 还没接通"
+                )
+            }
+            other => anyhow::bail!("未知附件类型：{}（当前仅支持 image）", other),
+        };
+        if seen.insert(kind.as_str()) {
+            out.push((kind, t));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_db_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("wx-cli-{name}-{nanos}.db"))
+    }
 
     fn transfer_xml(
         transfer_id: &str,
@@ -3242,6 +3794,143 @@ mod tests {
     fn parse_appmsg_formats_transfer_preview() {
         let xml = transfer_xml("t1", "8", "4075.00", "kuen133", "收到转账4075.00元");
         assert_eq!(parse_appmsg(&xml).as_deref(), Some("[转账] ￥4075.00"));
+    }
+
+    #[test]
+    fn image_cache_candidate_uses_month_session_and_message_identity() {
+        let base = std::path::Path::new("/tmp/xwechat_files/account");
+        let paths = image_cache_candidates(
+            base,
+            "Msg_34051634e027d564babcd7caadd3281a",
+            44280,
+            1777879275,
+        );
+
+        assert_eq!(
+            paths[0],
+            base.join("cache/2026-05/Message/34051634e027d564babcd7caadd3281a/Thumb/44280_1777879275_thumb.jpg")
+        );
+    }
+
+    #[test]
+    fn extract_embedded_image_bytes_finds_jpeg_payload_inside_dat() {
+        let mut input = b"wechat-v2-prefix".to_vec();
+        input.extend_from_slice(&[0xff, 0xd8, 0xff, 0xe0, b'J', b'F', b'I', b'F']);
+
+        let extracted = extract_embedded_image_bytes(&input).expect("expected jpeg payload");
+        assert_eq!(&extracted[..3], &[0xff, 0xd8, 0xff]);
+    }
+
+    #[test]
+    fn query_messages_includes_stable_group_sender_identity() {
+        let path = temp_db_path("query-messages-stable-sender");
+        {
+            let conn = Connection::open(&path).expect("open temp db");
+            conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+                .expect("create Name2Id table");
+            conn.execute(
+                "INSERT INTO Name2Id(rowid, user_name) VALUES (?1, ?2)",
+                rusqlite::params![42_i64, "wxid_alice"],
+            )
+            .expect("insert Name2Id row");
+            conn.execute(
+                "CREATE TABLE Msg_test (
+                    local_id INTEGER,
+                    local_type INTEGER,
+                    create_time INTEGER,
+                    real_sender_id INTEGER,
+                    message_content TEXT,
+                    WCDB_CT_message_content INTEGER
+                )",
+                [],
+            )
+            .expect("create message table");
+            conn.execute(
+                "INSERT INTO Msg_test VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![1_i64, 1_i64, 1775146911_i64, 42_i64, "hello", 0_i64],
+            )
+            .expect("insert text message");
+        }
+
+        let names = HashMap::from([("wxid_alice".to_string(), "Alice Contact".to_string())]);
+        let rows = query_messages(
+            &path,
+            "Msg_test",
+            "123@chatroom",
+            true,
+            &names,
+            None,
+            None,
+            None,
+            10,
+            0,
+            None,
+        )
+        .expect("query messages");
+
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["sender"].as_str(), Some("Alice Contact"));
+        assert_eq!(rows[0]["sender_username"].as_str(), Some("wxid_alice"));
+        assert_eq!(rows[0]["from_wxid"].as_str(), Some("wxid_alice"));
+        assert_eq!(
+            rows[0]["sender_contact_display"].as_str(),
+            Some("Alice Contact")
+        );
+    }
+
+    #[test]
+    fn search_in_table_includes_stable_group_sender_identity() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+            .expect("create Name2Id table");
+        conn.execute(
+            "INSERT INTO Name2Id(rowid, user_name) VALUES (?1, ?2)",
+            rusqlite::params![42_i64, "wxid_alice"],
+        )
+        .expect("insert Name2Id row");
+        conn.execute(
+            "CREATE TABLE Msg_test (
+                local_id INTEGER,
+                local_type INTEGER,
+                create_time INTEGER,
+                real_sender_id INTEGER,
+                message_content TEXT,
+                WCDB_CT_message_content INTEGER
+            )",
+            [],
+        )
+        .expect("create message table");
+        conn.execute(
+            "INSERT INTO Msg_test VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![1_i64, 1_i64, 1775146911_i64, 42_i64, "needle", 0_i64],
+        )
+        .expect("insert text message");
+
+        let names = HashMap::from([("wxid_alice".to_string(), "Alice Contact".to_string())]);
+        let rows = search_in_table(
+            &conn,
+            "Msg_test",
+            "123@chatroom",
+            true,
+            &names,
+            "needle",
+            None,
+            None,
+            None,
+            10,
+        )
+        .expect("search messages");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["sender"].as_str(), Some("Alice Contact"));
+        assert_eq!(rows[0]["sender_username"].as_str(), Some("wxid_alice"));
+        assert_eq!(rows[0]["from_wxid"].as_str(), Some("wxid_alice"));
+        assert_eq!(
+            rows[0]["sender_contact_display"].as_str(),
+            Some("Alice Contact")
+        );
     }
 
     #[test]

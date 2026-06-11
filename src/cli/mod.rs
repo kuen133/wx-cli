@@ -1,14 +1,15 @@
 pub mod asr_backfill;
+pub mod attachments;
+pub mod biz_articles;
 pub mod contacts;
 pub mod daemon_cmd;
 pub mod export;
+pub mod extract;
 pub mod favorites;
 pub mod friend_requests;
 pub mod history;
 mod init;
 pub mod members;
-pub mod moments;
-pub mod moments_inbox;
 pub mod new_messages;
 pub mod output;
 pub mod search;
@@ -21,6 +22,7 @@ pub mod transfers;
 pub mod transport;
 pub mod unread;
 
+use self::output::OutputOpts;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -231,50 +233,8 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// 查看朋友圈
-    Moments {
-        /// 显示数量
-        #[arg(short = 'n', long, default_value = "20")]
-        limit: usize,
-        /// 限定发布人（支持备注/昵称/wxid 模糊匹配）
-        #[arg(short = 'u', long)]
-        user: Option<String>,
-        /// 起始时间 YYYY-MM-DD
-        #[arg(long)]
-        since: Option<String>,
-        /// 结束时间 YYYY-MM-DD
-        #[arg(long)]
-        until: Option<String>,
-        /// 关键词搜索（匹配正文）
-        #[arg(short = 'q', long)]
-        query: Option<String>,
-        /// 附带媒体 URL 列表（图片/视频缩略图）
-        #[arg(long)]
-        with_media: bool,
-        /// 输出 JSON（默认 YAML）
-        #[arg(long)]
-        json: bool,
-    },
-    /// 朋友圈消息（别人评论/点赞我的通知）
-    #[command(name = "moments-inbox")]
-    MomentsInbox {
-        /// 显示数量
-        #[arg(short = 'n', long, default_value = "50")]
-        limit: usize,
-        /// 起始时间 YYYY-MM-DD
-        #[arg(long)]
-        since: Option<String>,
-        /// 结束时间 YYYY-MM-DD
-        #[arg(long)]
-        until: Option<String>,
-        /// 只看未读
-        #[arg(long)]
-        unread_only: bool,
-        /// 输出 JSON（默认 YAML）
-        #[arg(long)]
-        json: bool,
-    },
     /// 朋友圈互动通知：别人对我的朋友圈点赞/评论 + 我评过的帖子下的跟帖
+    #[command(name = "moments-inbox", alias = "sns-notifications")]
     SnsNotifications {
         /// 显示数量
         #[arg(short = 'n', long, default_value = "50")]
@@ -293,6 +253,7 @@ enum Commands {
         json: bool,
     },
     /// 朋友圈时间线：按时间/作者筛选本地缓存的朋友圈
+    #[command(name = "moments", alias = "sns-feed")]
     SnsFeed {
         /// 显示数量
         #[arg(short = 'n', long, default_value = "20")]
@@ -306,6 +267,33 @@ enum Commands {
         /// 只看指定作者（昵称 / 备注名 / 微信 ID，模糊匹配）
         #[arg(long)]
         user: Option<String>,
+        /// 关键词搜索（匹配正文）
+        #[arg(short = 'q', long)]
+        query: Option<String>,
+        /// 附带媒体 URL 列表（兼容参数；JSON 输出已包含结构化媒体字段）
+        #[arg(long)]
+        with_media: bool,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 查询公众号文章推送（本地缓存）
+    BizArticles {
+        /// 显示数量
+        #[arg(short = 'n', long, default_value = "50")]
+        limit: usize,
+        /// 限定公众号（名称模糊匹配）
+        #[arg(long)]
+        account: Option<String>,
+        /// 起始时间 YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束时间 YYYY-MM-DD
+        #[arg(long)]
+        until: Option<String>,
+        /// 只看有未读的公众号，每个公众号取最新 1 篇
+        #[arg(long)]
+        unread: bool,
         /// 输出 JSON（默认 YAML）
         #[arg(long)]
         json: bool,
@@ -326,6 +314,44 @@ enum Commands {
         /// 限定作者（昵称 / 备注名 / 微信 ID）
         #[arg(long)]
         user: Option<String>,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出某会话的图片附件，返回不透明 attachment_id
+    Attachments {
+        /// 会话名称（联系人显示名 / wxid / @chatroom username 都可以）
+        chat: String,
+        /// 类型（当前仅支持 image）
+        #[arg(long = "kind", value_name = "KIND",
+              value_parser = ["image", "img"])]
+        kinds: Vec<String>,
+        /// 显示数量
+        #[arg(short = 'n', long, default_value = "50")]
+        limit: usize,
+        /// 分页偏移
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        /// 起始时间 YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束时间 YYYY-MM-DD
+        #[arg(long)]
+        until: Option<String>,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 把单个 attachment_id 对应的资源解密写到指定文件路径
+    Extract {
+        /// 由 `wx attachments` 输出的不透明 ID（base64url 字符串）
+        attachment_id: String,
+        /// 输出文件路径（绝对或相对当前工作目录均可；扩展名建议保留为 .jpg 等）
+        #[arg(short = 'o', long)]
+        output: String,
+        /// 目标已存在时覆盖
+        #[arg(long)]
+        overwrite: bool,
         /// 输出 JSON（默认 YAML）
         #[arg(long)]
         json: bool,
@@ -447,22 +473,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             query,
             json,
         } => favorites::cmd_favorites(limit, fav_type, query, json),
-        Commands::Moments {
-            limit,
-            user,
-            since,
-            until,
-            query,
-            with_media,
-            json,
-        } => moments::cmd_moments(limit, user, since, until, query, with_media, json),
-        Commands::MomentsInbox {
-            limit,
-            since,
-            until,
-            unread_only,
-            json,
-        } => moments_inbox::cmd_moments_inbox(limit, since, until, unread_only, json),
         Commands::SnsNotifications {
             limit,
             since,
@@ -475,8 +485,24 @@ fn dispatch(cli: Cli) -> Result<()> {
             since,
             until,
             user,
+            query,
+            with_media: _,
             json,
-        } => sns_feed::cmd_sns_feed(limit, since, until, user, json),
+        } => {
+            if let Some(keyword) = query {
+                sns_search::cmd_sns_search(keyword, limit, since, until, user, json)
+            } else {
+                sns_feed::cmd_sns_feed(limit, since, until, user, json)
+            }
+        }
+        Commands::BizArticles {
+            limit,
+            account,
+            since,
+            until,
+            unread,
+            json,
+        } => biz_articles::cmd_biz_articles(limit, account, since, until, unread, json),
         Commands::SnsSearch {
             keyword,
             limit,
@@ -485,6 +511,33 @@ fn dispatch(cli: Cli) -> Result<()> {
             user,
             json,
         } => sns_search::cmd_sns_search(keyword, limit, since, until, user, json),
+        Commands::Attachments {
+            chat,
+            kinds,
+            limit,
+            offset,
+            since,
+            until,
+            json,
+        } => attachments::cmd_attachments(
+            chat,
+            kinds,
+            limit,
+            offset,
+            since,
+            until,
+            OutputOpts {
+                json,
+                with_meta: false,
+                debug_source: false,
+            },
+        ),
+        Commands::Extract {
+            attachment_id,
+            output,
+            overwrite,
+            json,
+        } => extract::cmd_extract(attachment_id, output, overwrite, json),
         Commands::FriendRequests {
             limit,
             since,
