@@ -49,6 +49,64 @@ pub fn read_db_salt(path: &Path) -> Option<String> {
     Some(hex::encode(&buf))
 }
 
+/// 试解 DB 第一页，确认 `enc_key` 是否真能解开这个数据库。
+pub fn verify_key_for_db(db_path: &Path, enc_key: &[u8; 32]) -> bool {
+    let mut page = vec![0u8; crate::crypto::PAGE_SZ];
+    let mut f = match std::fs::File::open(db_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    use std::io::Read;
+    if f.read_exact(&mut page).is_err() {
+        return false;
+    }
+
+    let dec = match crate::crypto::decrypt_page(enc_key, &page, 1) {
+        Ok(dec) => dec,
+        Err(_) => return false,
+    };
+
+    dec.len() >= crate::crypto::SQLITE_HDR.len()
+        && &dec[..crate::crypto::SQLITE_HDR.len()] == crate::crypto::SQLITE_HDR
+        && looks_like_sqlite_header_after_magic(&dec)
+}
+
+fn looks_like_sqlite_header_after_magic(page: &[u8]) -> bool {
+    if page.len() < 24 {
+        return false;
+    }
+
+    // decrypt_page 会重建第一页前 16 字节魔数；这里再检查魔数后的 SQLite
+    // header 固定字段，避免错误 key 因魔数被重建而误判通过。
+    let page_size = u16::from_be_bytes([page[16], page[17]]);
+    page_size == crate::crypto::PAGE_SZ as u16
+        && matches!(page[18], 1 | 2)
+        && matches!(page[19], 1 | 2)
+        && page[21] == 64
+        && page[22] == 32
+        && page[23] == 32
+}
+
+pub(crate) fn verified_key_entry(
+    db_dir: &Path,
+    db_name: &str,
+    key_hex: &str,
+    salt_hex: &str,
+) -> Option<KeyEntry> {
+    let enc_key = hex::decode_32(key_hex)?;
+    let db_path = db_dir.join(db_name);
+    if !verify_key_for_db(&db_path, &enc_key) {
+        return None;
+    }
+
+    Some(KeyEntry {
+        db_name: db_name.to_string(),
+        enc_key: key_hex.to_string(),
+        salt: salt_hex.to_string(),
+    })
+}
+
 /// 遍历 db_dir，收集所有 .db 文件的 salt -> 相对路径 映射
 pub fn collect_db_salts(db_dir: &Path) -> Vec<(String, String)> {
     let mut result = Vec::new();
@@ -81,12 +139,41 @@ mod hex {
     pub fn encode(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{:02x}", b)).collect()
     }
+
+    pub fn decode_32(s: &str) -> Option<[u8; 32]> {
+        if s.len() != 64 {
+            return None;
+        }
+
+        let mut out = [0u8; 32];
+        for (idx, pair) in s.as_bytes().chunks_exact(2).enumerate() {
+            let hi = decode_nibble(pair[0])?;
+            let lo = decode_nibble(pair[1])?;
+            out[idx] = (hi << 4) | lo;
+        }
+        Some(out)
+    }
+
+    fn decode_nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes::Aes256;
+    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+    use cbc::Encryptor;
     use std::fs;
+
+    type Block = aes::cipher::Block<Aes256>;
+    type Aes256CbcEnc = Encryptor<Aes256>;
 
     /// 创建一个进程唯一的临时目录（测试用），返回路径；测试结束后调用方负责删除
     fn make_temp_dir(label: &str) -> std::path::PathBuf {
@@ -99,6 +186,39 @@ mod tests {
         ));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    fn aes_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Vec<u8> {
+        assert_eq!(data.len() % 16, 0);
+        let mut blocks: Vec<Block> = data.chunks_exact(16).map(Block::clone_from_slice).collect();
+        Aes256CbcEnc::new(key.into(), iv.into()).encrypt_blocks_mut(&mut blocks);
+        blocks.iter().flat_map(|b| b.iter().copied()).collect()
+    }
+
+    fn encrypted_first_page(key: &[u8; 32], salt: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
+        let mut plain = vec![0u8; crate::crypto::PAGE_SZ];
+        plain[..crate::crypto::SQLITE_HDR.len()].copy_from_slice(crate::crypto::SQLITE_HDR);
+        plain[16..18].copy_from_slice(&(crate::crypto::PAGE_SZ as u16).to_be_bytes());
+        plain[18] = 1;
+        plain[19] = 1;
+        plain[21] = 64;
+        plain[22] = 32;
+        plain[23] = 32;
+
+        let ciphertext = aes_cbc_encrypt(
+            key,
+            iv,
+            &plain[crate::crypto::SALT_SZ..crate::crypto::PAGE_SZ - crate::crypto::RESERVE_SZ],
+        );
+
+        let mut page = vec![0u8; crate::crypto::PAGE_SZ];
+        page[..crate::crypto::SALT_SZ].copy_from_slice(salt);
+        page[crate::crypto::SALT_SZ..crate::crypto::PAGE_SZ - crate::crypto::RESERVE_SZ]
+            .copy_from_slice(&ciphertext);
+        page[crate::crypto::PAGE_SZ - crate::crypto::RESERVE_SZ
+            ..crate::crypto::PAGE_SZ - crate::crypto::RESERVE_SZ + 16]
+            .copy_from_slice(iv);
+        page
     }
 
     // ── read_db_salt ──────────────────────────────────────────────────────────
@@ -145,6 +265,46 @@ mod tests {
     #[test]
     fn test_read_db_salt_nonexistent() {
         assert!(read_db_salt(Path::new("/nonexistent/surely/not/here.db")).is_none());
+    }
+
+    #[test]
+    fn test_verify_key_for_db_accepts_matching_encrypted_page() {
+        let dir = make_temp_dir("verify-ok");
+        let path = dir.join("enc.db");
+        let key = [0x42u8; 32];
+        let salt = [0x24u8; 16];
+        let iv = [0x11u8; 16];
+        let page = encrypted_first_page(&key, &salt, &iv);
+        fs::write(&path, &page).unwrap();
+
+        assert!(verify_key_for_db(&path, &key));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_verify_key_for_db_rejects_wrong_key() {
+        let dir = make_temp_dir("verify-wrong-key");
+        let path = dir.join("enc.db");
+        let key = [0x42u8; 32];
+        let wrong_key = [0x99u8; 32];
+        let salt = [0x24u8; 16];
+        let iv = [0x11u8; 16];
+        let page = encrypted_first_page(&key, &salt, &iv);
+        fs::write(&path, &page).unwrap();
+
+        assert!(!verify_key_for_db(&path, &wrong_key));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_verify_key_for_db_rejects_short_file() {
+        let dir = make_temp_dir("verify-short");
+        let path = dir.join("short.db");
+        let key = [0x42u8; 32];
+        fs::write(&path, b"too short").unwrap();
+
+        assert!(!verify_key_for_db(&path, &key));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

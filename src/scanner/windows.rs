@@ -19,7 +19,7 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 
-use super::{collect_db_salts, KeyEntry};
+use super::{collect_db_salts, verified_key_entry, KeyEntry};
 
 const HEX_PATTERN_LEN: usize = 96;
 const CHUNK_SIZE: usize = 2 * 1024 * 1024;
@@ -83,12 +83,11 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
     for (key_hex, salt_hex) in &raw_keys {
         for (db_salt, db_name) in &db_salts {
             if salt_hex == db_salt {
-                entries.push(KeyEntry {
-                    db_name: db_name.clone(),
-                    enc_key: key_hex.clone(),
-                    salt: salt_hex.clone(),
-                });
-                break;
+                if let Some(entry) = verified_key_entry(db_dir, db_name, key_hex, salt_hex) {
+                    entries.push(entry);
+                    break;
+                }
+                eprintln!("salt 匹配但试解验证失败，跳过: {}", db_name);
             }
         }
     }
