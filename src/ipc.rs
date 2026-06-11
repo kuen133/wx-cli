@@ -33,6 +33,18 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         until: Option<i64>,
     },
+    Redpackets {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+    TransferEvents {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+    },
     Search {
         keyword: String,
         #[serde(skip_serializing_if = "Option::is_none")]

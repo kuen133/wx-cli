@@ -194,6 +194,18 @@ async fn dispatch(
                 Err(e) => Response::err(e.to_string()),
             }
         }
+        Redpackets { limit } => match query::q_redpackets(db, &names_arc, limit).await {
+            Ok(v) => Response::ok(v),
+            Err(e) => Response::err(e.to_string()),
+        },
+        TransferEvents {
+            limit,
+            since,
+            until,
+        } => match query::q_transfer_events(db, &names_arc, limit, since, until).await {
+            Ok(v) => Response::ok(v),
+            Err(e) => Response::err(e.to_string()),
+        },
         Search {
             keyword,
             chats,

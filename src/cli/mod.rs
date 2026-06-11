@@ -14,12 +14,14 @@ mod init;
 pub mod members;
 pub mod new_messages;
 pub mod output;
+pub mod redpackets;
 pub mod search;
 pub mod sessions;
 pub mod sns_feed;
 pub mod sns_notifications;
 pub mod sns_search;
 pub mod stats;
+pub mod transfer_events;
 pub mod transfers;
 pub mod transport;
 pub mod unread;
@@ -96,6 +98,31 @@ enum Commands {
         /// 只输出汇总表，不输出逐笔明细
         #[arg(long)]
         summary_only: bool,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 红包事件/状态记录（general.db；金额不在表内，金额见 wx transfers）
+    Redpackets {
+        /// 限制返回条数
+        #[arg(short = 'n', long)]
+        limit: Option<usize>,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 转账事务事件/状态记录（general.db；金额不在表内，金额见 wx transfers）
+    #[command(name = "transfer-events")]
+    TransferEvents {
+        /// 限制返回条数
+        #[arg(short = 'n', long)]
+        limit: Option<usize>,
+        /// 起始 begin_transfer_time（YYYY-MM-DD / YYYY-MM-DD HH:MM）
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束 begin_transfer_time（YYYY-MM-DD / YYYY-MM-DD HH:MM）
+        #[arg(long)]
+        until: Option<String>,
         /// 输出 JSON（默认 YAML）
         #[arg(long)]
         json: bool,
@@ -465,6 +492,13 @@ fn dispatch(cli: Cli) -> Result<()> {
             summary_only,
             json,
         } => transfers::cmd_transfers(chat, month, since, until, summary_only, json),
+        Commands::Redpackets { limit, json } => redpackets::cmd_redpackets(limit, json),
+        Commands::TransferEvents {
+            limit,
+            since,
+            until,
+            json,
+        } => transfer_events::cmd_transfer_events(limit, since, until, json),
         Commands::AsrBackfill {
             since,
             until,
