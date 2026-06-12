@@ -1,4 +1,5 @@
 use super::*;
+use crate::ipc::NewMessageCursor;
 
 pub(crate) fn msg_table_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -321,10 +322,18 @@ pub(super) fn query_messages(
     Ok(result)
 }
 
+struct NewMessageHit {
+    rel_key: String,
+    username: String,
+    create_time: i64,
+    local_id: i64,
+    msg: Value,
+}
+
 pub async fn q_new_messages(
     db: &DbCache,
     names: &Names,
-    state: Option<HashMap<String, i64>>,
+    state: Option<HashMap<String, NewMessageCursor>>,
     limit: usize,
 ) -> Result<Value> {
     // 首次运行（state=None）或未见过的会话，用 24h 前作为起点，
@@ -352,22 +361,31 @@ pub async fn q_new_messages(
     .await??;
 
     // 2. 记录 session.db 的当前快照（用于构建 new_state 基础）
-    let session_ts_map: HashMap<String, i64> = all_sessions
+    let session_cursor_map: HashMap<String, NewMessageCursor> = all_sessions
         .iter()
-        .map(|(u, ts)| (u.clone(), *ts))
+        .map(|(u, ts)| {
+            let cursor = state
+                .as_ref()
+                .and_then(|m| m.get(u))
+                .copied()
+                .filter(|cursor| cursor.create_time == *ts && cursor.local_id.is_some())
+                .unwrap_or(NewMessageCursor { create_time: *ts, local_id: None });
+            (u.clone(), cursor)
+        })
         .collect();
 
     // 3. 找出有新消息的会话
     // 不在 state 中的会话（首次运行或新会话）以 fallback_ts 为基准
-    let changed: Vec<(String, i64)> = all_sessions
+    let changed: Vec<(String, NewMessageCursor)> = all_sessions
         .into_iter()
-        .filter(|(uname, ts)| {
-            let last_known = state
+        .filter_map(|(uname, ts)| {
+            let cursor = state
                 .as_ref()
-                .and_then(|m| m.get(uname))
+                .and_then(|m| m.get(&uname))
                 .copied()
-                .unwrap_or(fallback_ts);
-            *ts > last_known
+                .unwrap_or(NewMessageCursor { create_time: fallback_ts, local_id: None });
+            (ts > cursor.create_time || (cursor.local_id.is_some() && ts == cursor.create_time))
+                .then_some((uname, cursor))
         })
         .collect();
 
@@ -377,7 +395,7 @@ pub async fn q_new_messages(
             json!({
                 "count": 0,
                 "messages": [],
-                "new_state": session_ts_map,
+                "new_state": session_cursor_map,
             }),
             meta,
         ));
@@ -386,15 +404,10 @@ pub async fn q_new_messages(
     // 4. 只查询有新消息的会话的消息表
     // per_table_limit 取 limit*5 防止单表截断，最终由全局 truncate 收尾
     let per_table_limit = limit.saturating_mul(5).max(200);
-    let mut all_msgs: Vec<(String, Value)> = Vec::new();
+    let mut all_msgs: Vec<NewMessageHit> = Vec::new();
     let mut hit_shards = std::collections::HashSet::new();
 
-    for (uname, _) in &changed {
-        let since_ts = state
-            .as_ref()
-            .and_then(|m| m.get(uname))
-            .copied()
-            .unwrap_or(fallback_ts);
+    for (uname, since_cursor) in &changed {
         let tables = find_msg_table_infos(db, names, uname).await?;
         if tables.is_empty() {
             continue;
@@ -412,8 +425,10 @@ pub async fn q_new_messages(
             let display2 = display.clone();
             let names_map = names.map.clone();
             let tname_for_log = tname.clone();
+            let since_cursor2 = *since_cursor;
+            let rel_key2 = rel_key.clone();
 
-            let msgs: Vec<Value> = match tokio::task::spawn_blocking(move || {
+            let msgs: Vec<NewMessageHit> = match tokio::task::spawn_blocking(move || {
                 let conn = Connection::open(&path)?;
                 ensure_create_time_index(&conn, &tname);
                 let id2u = load_id2u(&conn);
@@ -421,22 +436,33 @@ pub async fn q_new_messages(
                 let sql = format!(
                     "SELECT local_id, local_type, create_time, real_sender_id,
                             message_content, WCDB_CT_message_content
-                     FROM [{}] WHERE create_time > ? ORDER BY create_time ASC LIMIT ?",
+                     FROM [{}]
+                     WHERE (create_time > ? OR (? IS NOT NULL AND create_time = ? AND local_id > ?))
+                     ORDER BY create_time ASC, local_id ASC LIMIT ?",
                     tname
                 );
                 let rows: Vec<_> = conn
                     .prepare(&sql)
                     .and_then(|mut stmt| {
-                        stmt.query_map(rusqlite::params![since_ts, per_table_limit as i64], |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, i64>(2)?,
-                                row.get::<_, i64>(3)?,
-                                get_content_bytes(row, 4),
-                                row.get::<_, i64>(5).unwrap_or(0),
-                            ))
-                        })
+                        stmt.query_map(
+                            rusqlite::params![
+                                since_cursor2.create_time,
+                                since_cursor2.local_id,
+                                since_cursor2.create_time,
+                                since_cursor2.local_id,
+                                per_table_limit as i64
+                            ],
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, i64>(1)?,
+                                    row.get::<_, i64>(2)?,
+                                    row.get::<_, i64>(3)?,
+                                    get_content_bytes(row, 4),
+                                    row.get::<_, i64>(5).unwrap_or(0),
+                                ))
+                            },
+                        )
                         .map(|it| it.filter_map(|r| r.ok()).collect())
                     })
                     .unwrap_or_default();
@@ -467,7 +493,13 @@ pub async fn q_new_messages(
                         "type": fmt_type(local_type),
                     });
                     add_sender_identity(&mut msg, is_group, &sender_username, &names_map);
-                    result.push(msg);
+                    result.push(NewMessageHit {
+                        rel_key: rel_key2.clone(),
+                        username: uname2.clone(),
+                        create_time: ts,
+                        local_id,
+                        msg,
+                    });
                 }
                 Ok::<_, anyhow::Error>(result)
             })
@@ -487,39 +519,41 @@ pub async fn q_new_messages(
             if !msgs.is_empty() {
                 hit_shards.insert(rel_key.clone());
             }
-            all_msgs.extend(msgs.into_iter().map(|msg| (rel_key.clone(), msg)));
+            all_msgs.extend(msgs);
         }
     }
 
-    all_msgs.sort_by_key(|(_, m)| m["timestamp"].as_i64().unwrap_or(0));
+    all_msgs.sort_by_key(|hit| (hit.create_time, hit.local_id));
     all_msgs.truncate(limit);
-    let chat_latest = latest_from_sourced_messages(&all_msgs);
+    let chat_latest = latest_from_sourced_messages(
+        &all_msgs
+            .iter()
+            .map(|hit| (hit.rel_key.clone(), hit.msg.clone()))
+            .collect::<Vec<_>>(),
+    );
 
     // 5. 重建 new_state，防止全局 limit 截断导致消息永久丢失：
     //    - 未变化的会话：沿用 session.db 的 last_timestamp
-    //    - 变化但全被截断（无消息在最终结果中）：保留旧 since_ts，下次重试
-    //    - 变化且有消息返回：推进到该会话在结果中的最大 timestamp
-    let mut new_state = session_ts_map;
-    // 先把 changed 会话重置回旧 since_ts
-    for (uname, _) in &changed {
-        let old_ts = state
-            .as_ref()
-            .and_then(|m| m.get(uname))
-            .copied()
-            .unwrap_or(fallback_ts);
-        new_state.insert(uname.clone(), old_ts);
+    //    - 变化但全被截断（无消息在最终结果中）：保留旧 cursor，下次重试
+    //    - 变化且有消息返回：推进到该会话在结果中的最大 (create_time, local_id)
+    let mut new_state = session_cursor_map;
+    // 先把 changed 会话重置回旧 cursor
+    for (uname, cursor) in &changed {
+        new_state.insert(uname.clone(), *cursor);
     }
     // 再根据实际返回的消息向前推进
-    for (_, m) in &all_msgs {
-        if let (Some(uname), Some(ts)) = (m["username"].as_str(), m["timestamp"].as_i64()) {
-            let e = new_state.entry(uname.to_string()).or_insert(0);
-            if ts > *e {
-                *e = ts;
-            }
+    for hit in &all_msgs {
+        let e = new_state
+            .entry(hit.username.clone())
+            .or_insert(NewMessageCursor { create_time: 0, local_id: None });
+        if hit.create_time > e.create_time {
+            *e = NewMessageCursor { create_time: hit.create_time, local_id: Some(hit.local_id) };
+        } else if hit.create_time == e.create_time && Some(hit.local_id) > e.local_id {
+            e.local_id = Some(hit.local_id);
         }
     }
 
-    let messages: Vec<Value> = all_msgs.into_iter().map(|(_, msg)| msg).collect();
+    let messages: Vec<Value> = all_msgs.into_iter().map(|hit| hit.msg).collect();
     let meta = build_query_meta(
         db,
         names,
@@ -538,4 +572,117 @@ pub async fn q_new_messages(
         }),
         meta,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::cache::DbCache;
+
+    const FAKE_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn unique_tmpdir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("wx-cli-new-messages-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn mtime_nanos_for_test(path: &Path) -> u64 {
+        std::fs::metadata(path).and_then(|m| m.modified()).map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
+        }).unwrap_or(0)
+    }
+
+    fn insert_message(path: &Path, chat_uname: &str, local_id: i64, ts: i64, content: &str) {
+        let table_name = format!("Msg_{:x}", md5::compute(chat_uname.as_bytes()));
+        let conn = Connection::open(path).expect("open message db");
+        conn.execute(
+            &format!("INSERT INTO [{}] VALUES (?1, ?2, ?3, ?4, ?5, ?6)", table_name),
+            rusqlite::params![local_id, 1_i64, ts, 7_i64, content, 0_i64],
+        ).expect("insert message");
+    }
+
+    async fn seeded_cache(root: &Path, entries: &[(&str, &Path)]) -> DbCache {
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let mut all_keys = HashMap::new();
+        let mut mtimes = serde_json::Map::new();
+        for (rel_key, decrypted_path) in entries {
+            let raw_db_path = db_dir.join(rel_key);
+            std::fs::create_dir_all(raw_db_path.parent().unwrap()).unwrap();
+            std::fs::write(&raw_db_path, b"fake encrypted db").unwrap();
+            all_keys.insert((*rel_key).to_string(), FAKE_KEY_HEX.to_string());
+            mtimes.insert(
+                (*rel_key).to_string(),
+                json!({
+                    "db_mt": mtime_nanos_for_test(&raw_db_path),
+                    "wal_mt": 0u64,
+                    "path": decrypted_path.display().to_string(),
+                }),
+            );
+        }
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        std::fs::write(&mtime_file, serde_json::Value::Object(mtimes).to_string()).unwrap();
+        DbCache::with_dirs(db_dir, cache_dir, mtime_file, all_keys).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn new_messages_returns_same_second_arrivals_without_duplicates() {
+        let root = unique_tmpdir("same-second");
+        let session_db = root.join("session.db");
+        let message_db = root.join("message_0.db");
+        let rel_key = "message/message_0.db";
+        let chat_uname = "room@chatroom";
+        let same_second = chrono::Utc::now().timestamp();
+
+        Connection::open(&session_db).unwrap().execute_batch(&format!(
+            "CREATE TABLE SessionTable (username TEXT, last_timestamp INTEGER);
+             INSERT INTO SessionTable VALUES ('{chat_uname}', {same_second});"
+        )).unwrap();
+        let table_name = format!("Msg_{:x}", md5::compute(chat_uname.as_bytes()));
+        Connection::open(&message_db).unwrap().execute_batch(&format!(
+            "CREATE TABLE Name2Id (user_name TEXT);
+             INSERT INTO Name2Id(rowid, user_name) VALUES (7, 'wxid_sender');
+             CREATE TABLE [{table_name}] (local_id INTEGER, local_type INTEGER,
+                create_time INTEGER, real_sender_id INTEGER, message_content TEXT,
+                WCDB_CT_message_content INTEGER);"
+        )).unwrap();
+        insert_message(&message_db, chat_uname, 1, same_second, "first");
+
+        let cache = seeded_cache(&root, &[("session/session.db", &session_db), (rel_key, &message_db)]).await;
+        let names = Names {
+            map: HashMap::from([
+                (chat_uname.to_string(), "Test Room".to_string()),
+                ("wxid_sender".to_string(), "Sender".to_string()),
+            ]),
+            md5_to_uname: HashMap::new(),
+            msg_db_keys: vec![rel_key.to_string()],
+            verify_flags: HashMap::new(),
+        };
+
+        let first = q_new_messages(&cache, &names, None, 10).await.expect("first new-messages");
+        assert_eq!(first["count"].as_u64(), Some(1));
+        assert_eq!(first["messages"][0]["content"].as_str(), Some("first"));
+        assert!(first["messages"][0].get("local_id").is_none());
+        let first_state: HashMap<String, NewMessageCursor> =
+            serde_json::from_value(first["new_state"].clone()).unwrap();
+        assert_eq!(first_state.get(chat_uname).copied(), Some(NewMessageCursor { create_time: same_second, local_id: Some(1) }));
+
+        insert_message(&message_db, chat_uname, 2, same_second, "second");
+
+        let second = q_new_messages(&cache, &names, Some(first_state), 10).await.expect("second new-messages");
+        assert_eq!(second["count"].as_u64(), Some(1));
+        assert_eq!(second["messages"][0]["content"].as_str(), Some("second"));
+        let second_state: HashMap<String, NewMessageCursor> =
+            serde_json::from_value(second["new_state"].clone()).unwrap();
+        assert_eq!(second_state.get(chat_uname).copied(), Some(NewMessageCursor { create_time: same_second, local_id: Some(2) }));
+
+        let third = q_new_messages(&cache, &names, Some(second_state), 10).await.expect("third new-messages");
+        assert_eq!(third["count"].as_u64(), Some(0));
+    }
 }

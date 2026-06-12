@@ -2,6 +2,36 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct NewMessageCursor {
+    pub create_time: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum NewMessageCursorWire {
+    Legacy(i64),
+    Current {
+        create_time: i64,
+        #[serde(default)]
+        local_id: Option<i64>,
+    },
+}
+
+impl<'de> Deserialize<'de> for NewMessageCursor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match NewMessageCursorWire::deserialize(deserializer)? {
+            NewMessageCursorWire::Legacy(create_time) => Self { create_time, local_id: None },
+            NewMessageCursorWire::Current { create_time, local_id } => Self { create_time, local_id },
+        })
+    }
+}
+
 /// CLI 向 daemon 发送的请求（换行符分隔 JSON，与 Python 版兼容）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -75,10 +105,10 @@ pub enum Request {
         chat: String,
     },
     NewMessages {
-        /// 上次检查时各会话的 last_timestamp 快照（username -> ts）
+        /// 上次检查时各会话的消息游标（兼容旧格式 username -> ts）
         /// None 表示首次运行，会返回 new_state 供下次使用
         #[serde(skip_serializing_if = "Option::is_none")]
-        state: Option<HashMap<String, i64>>,
+        state: Option<HashMap<String, NewMessageCursor>>,
         #[serde(default = "default_limit_200")]
         limit: usize,
     },
@@ -257,6 +287,25 @@ fn default_limit_50() -> usize {
 }
 fn default_limit_200() -> usize {
     200
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_messages_request_accepts_legacy_second_state() {
+        let req: Request = serde_json::from_str(
+            r#"{"cmd":"new_messages","state":{"room@chatroom":1775146911},"limit":10}"#,
+        )
+        .expect("legacy state should parse");
+        let Request::NewMessages { state, limit } = req else { panic!("wrong request variant") };
+        assert_eq!(limit, 10);
+        assert_eq!(
+            state.unwrap().get("room@chatroom").copied(),
+            Some(NewMessageCursor { create_time: 1_775_146_911, local_id: None })
+        );
+    }
 }
 
 fn is_false(v: &bool) -> bool {
