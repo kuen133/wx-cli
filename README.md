@@ -32,6 +32,22 @@ Forked from **[jackwener/wx-cli](https://github.com/jackwener/wx-cli)**，当前
 | ⚡ perf | `wx search` 25-40× 提速：自建 trigram FTS5 索引（upstream 用 LIKE 全表扫；微信的 `message_fts.db` 用私有 `MMFtsTokenizer`，标准 SQLite 打不开） |
 | ⚡ perf | 继承 upstream WAL 增量缓存：主库不变、仅 WAL 更新时避免整库重新解密 |
 
+**2026-06 新增（codex 执行 + Claude 监工审查流水线产出）：**
+
+| 类型 | 改动 |
+|---|---|
+| ✨ feat | `wx asr-backfill` + `wx history --with-asr`：微信语音转文字（百炼 `Qwen3-ASR-Flash`），转写缓存到本地，普通 `history` 直接显示 |
+| ✨ feat | `wx transfers` 转账台账（逐笔明细 + 月度汇总） |
+| ✨ feat | `wx avatars` 头像导出 · `wx files` 文件/图片/视频索引（hardlink） · `wx redpackets` 红包事件 · `wx transfer-events` 转账事务台账 |
+| 🐛 fix | 解密首页魔数校验：密钥错/页格式变即刻明确报错，不再静默写乱码 |
+| 🐛 fix | scanner 密钥试解验证：避免仅凭 salt 撞库选错 key |
+| 🐛 fix | 名片(42)/位置(48) 消息裸 XML → 解析为 `[名片]`/`[位置]` |
+| 🐛 fix | 搜索增量 & `new-messages` 游标升级为 `(create_time, local_id)` keyset，消除同秒漏消息/漏索引 |
+| 🔒 sec | daemon `umask(0600)`：解密明文不再对同机其他用户可读 |
+| ⚡ perf | 解密缓存 per-key 锁 + 写临时文件原子 rename，消除并发撕裂读（"database disk image is malformed"） |
+| ⚡ perf | `create_time` 索引消除大群全表扫描；ASR 缓存读批量化 + `asr-backfill` 限流并发 |
+| ♻️ refactor | `query.rs` 4180 行拆为 `query/` 16 子模块（纯移动，行为不变）；消除 `search_index` 与 `query` 的重复；接通查询新鲜度元数据 |
+
 看详细变更：[commit log](../../commits) · [原始 upstream](https://github.com/jackwener/wx-cli)
 
 ---
@@ -217,6 +233,22 @@ wx sns-search "婚礼" --user "李四" --since 2023-01-01
 - `sns-feed` / `sns-search` 返回帖子：`author`、`content`、`media`、`media_count`、`location`、`timestamp`
 
 朋友圈数据只覆盖你本地刷到过的帖子（微信 app 按需下载）。
+
+### 资源导出 & 资金事件
+
+```bash
+wx avatars                                       # 列出头像元数据（username/md5/大小/时间）
+wx avatars --username "张三" --out ./avatars     # 导出某人头像（按 magic 自动判 jpg/png/gif/webp）
+wx files --type image -n 50                       # 本地图片索引（来自微信 hardlink 库）
+wx files --type video                             # 视频索引（md5/文件名/大小/时间）
+wx files --type file                              # 文件索引
+wx redpackets                                     # 红包事件/状态（general.db）
+wx transfer-events                                # 转账事务台账（transfer_id/对手方/时间/状态）
+```
+
+- `avatars` 列模式输出元数据；带 `--out` 时把头像 BLOB 写成图片文件，用户名做了路径安全处理。
+- `files` 读微信 `hardlink.db` 的文件索引（全局 md5 维度），可按 `--type image|video|file` 与 `--since/--until/-n` 过滤。
+- `redpackets` / `transfer-events` 读 `general.db`，是**事件/状态记录**——两表本身**不含金额**，转账金额请用 `wx transfers`。
 
 ### 联系人 & 群组
 
